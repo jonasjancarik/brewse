@@ -5,7 +5,6 @@ An interactive TUI (Terminal User Interface) browser for Homebrew packages. Brew
 ## Features
 
 - Interactive search interface for both Formulae and Casks
-- Real-time package filtering as you type
 - Detailed package information including:
   - Version
   - Description
