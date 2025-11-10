@@ -20,6 +20,7 @@ class BrewPackage:
     name: str
     category: str  # 'Formulae' or 'Casks'
     installed: bool = False
+    analytics_30d: int = 0  # 30-day install count for sorting
 
 
 @dataclass
@@ -41,6 +42,7 @@ class BrewInteractive:
         self.view_mode = "search"
         self.current_package_info: Optional[PackageInfo] = None
         self.search_term = ""
+        self.showing_top_packages = False  # Track if we're showing top packages
         self.api_base_url = "https://formulae.brew.sh/api"
         # Add cache directory
         self.cache_dir = Path.home() / ".cache" / "brewse"
@@ -58,6 +60,13 @@ class BrewInteractive:
         # Cache installed packages lists
         self._installed_formulae = None
         self._installed_casks = None
+        # Cache bulk analytics data
+        self._formulae_analytics = None
+        self._casks_analytics = None
+        # Cache system binary checks (which command results)
+        self._system_binary_cache = {}
+        # Track install/uninstall operations in progress
+        self.operation_in_progress = None  # None, "installing", or "uninstalling"
 
     def _get_cache_path(self, url: str) -> Path:
         """Generate a cache file path from URL."""
@@ -228,6 +237,126 @@ class BrewInteractive:
             except Exception:
                 self._installed_casks = set()
 
+    def _load_analytics_data(self) -> None:
+        """Load bulk analytics data for all formulae and casks."""
+        if self._formulae_analytics is None:
+            try:
+                # Fetch bulk analytics for formulae (30-day installs)
+                url = f"{self.api_base_url}/analytics/install/30d.json"
+                data = self._fetch_json(url)
+                # The API returns data in format: {"items": [{"formula": "name", "count": 123}, ...]}
+                self._formulae_analytics = {}
+                if "items" in data:
+                    for item in data["items"]:
+                        formula_name = item.get("formula") or item.get("name")
+                        count = item.get("count", 0)
+                        if formula_name:
+                            # Handle string numbers with commas
+                            if isinstance(count, str):
+                                count = int(count.replace(",", ""))
+                            self._formulae_analytics[formula_name] = count
+            except Exception as e:
+                print(f"Error loading formulae analytics: {e}")
+                self._formulae_analytics = {}
+
+        if self._casks_analytics is None:
+            try:
+                # Fetch bulk analytics for casks (30-day installs)
+                url = f"{self.api_base_url}/analytics/cask-install/30d.json"
+                data = self._fetch_json(url)
+                # The API returns data in format: {"items": [{"cask": "name", "count": 123}, ...]}
+                self._casks_analytics = {}
+                if "items" in data:
+                    for item in data["items"]:
+                        cask_name = item.get("cask") or item.get("name")
+                        count = item.get("count", 0)
+                        if cask_name:
+                            # Handle string numbers with commas
+                            if isinstance(count, str):
+                                count = int(count.replace(",", ""))
+                            self._casks_analytics[cask_name] = count
+            except Exception as e:
+                print(f"Error loading casks analytics: {e}")
+                self._casks_analytics = {}
+
+    def _get_package_analytics(self, package_name: str, category: str) -> int:
+        """Get 30-day analytics for a package from bulk analytics data."""
+        self._load_analytics_data()
+        if category == "Formulae":
+            return (
+                self._formulae_analytics.get(package_name, 0)
+                if self._formulae_analytics
+                else 0
+            )
+        else:  # Casks
+            return (
+                self._casks_analytics.get(package_name, 0)
+                if self._casks_analytics
+                else 0
+            )
+
+    def _check_system_binary(self, binary_name: str) -> bool:
+        """Check if a binary exists on the system using 'which' command."""
+        if binary_name in self._system_binary_cache:
+            return self._system_binary_cache[binary_name]
+
+        try:
+            result = subprocess.run(
+                ["which", binary_name],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            exists = result.returncode == 0
+            self._system_binary_cache[binary_name] = exists
+            return exists
+        except Exception:
+            # If which fails, assume it doesn't exist
+            self._system_binary_cache[binary_name] = False
+            return False
+
+    def _is_package_installed(
+        self,
+        package_name: str,
+        category: str,
+        package_data: Optional[dict] = None,
+        check_system_binary: bool = True,
+    ) -> bool:
+        """Check if a package is installed via Homebrew or as a system binary.
+
+        Args:
+            package_name: Name of the package
+            category: 'Formulae' or 'Casks'
+            package_data: Optional package data dict (for system binary checking)
+            check_system_binary: If False, only check Homebrew (faster for bulk operations)
+        """
+        # First check Homebrew installation (fast)
+        if category == "Formulae":
+            if self._installed_formulae and package_name in self._installed_formulae:
+                return True
+        else:  # Casks
+            if self._installed_casks and package_name in self._installed_casks:
+                return True
+
+        # Skip system binary check if not requested (for performance in bulk operations)
+        if not check_system_binary:
+            return False
+
+        # If not in Homebrew, check system binary
+        # Try the package name first (most packages install a binary with the same name)
+        if self._check_system_binary(package_name):
+            return True
+
+        # If package_data is provided, check additional binaries it provides
+        if package_data:
+            binaries = self._get_package_binaries(package_data)
+            for binary_name in binaries:
+                if binary_name != package_name:  # Already checked above
+                    if self._check_system_binary(binary_name):
+                        return True
+
+        return False
+
     def run_brew_search(self, term: str) -> None:
         """Search packages using the Homebrew API."""
         # Reset position when performing new search
@@ -267,11 +396,13 @@ class BrewInteractive:
             for formula in self.formulae_data:
                 if term_lower in formula["name"].lower():
                     name = formula["name"]
+                    # Check both Homebrew and system installation
+                    installed = self._is_package_installed(name, "Formulae", formula)
                     self.packages.append(
                         BrewPackage(
                             name=name,
                             category="Formulae",
-                            installed=name in self._installed_formulae,
+                            installed=installed,
                         )
                     )
 
@@ -279,16 +410,173 @@ class BrewInteractive:
             for cask in self.casks_data:
                 if term_lower in cask["token"].lower():
                     name = cask["token"]
+                    # Check both Homebrew and system installation
+                    installed = self._is_package_installed(name, "Casks", cask)
                     self.packages.append(
                         BrewPackage(
                             name=name,
                             category="Casks",
-                            installed=name in self._installed_casks,
+                            installed=installed,
                         )
                     )
 
         except Exception as e:
             print(f"Error fetching search results: {str(e)}")
+
+    def load_top_packages(self, limit: int = 100) -> None:
+        """Load top packages by popularity (30-day installs) that are not installed.
+
+        Args:
+            limit: Number of top packages to return
+        """
+        # Reset position
+        self.selected_index = 0
+        self.scroll_offset = 0
+        self.search_term = ""  # Empty search term for top packages view
+
+        # Wait for data to be loaded if necessary
+        while not self.is_data_loaded:
+            if not self.is_loading:
+                self.is_loading = True
+                self.formulae_data = self._fetch_json(
+                    f"{self.api_base_url}/formula.json"
+                )
+                self.casks_data = self._fetch_json(f"{self.api_base_url}/cask.json")
+                self.is_data_loaded = True
+            else:
+                height, width = self.stdscr.getmaxyx()
+                loading_msg = "Loading package data..."
+                self.stdscr.clear()
+                self.stdscr.addstr(
+                    height // 2, (width - len(loading_msg)) // 2, loading_msg
+                )
+                self.stdscr.refresh()
+                time.sleep(0.1)
+
+        try:
+            # Get all installed packages once
+            self._get_installed_packages()
+
+            # Load bulk analytics data first (just 2 API calls total!)
+            height, width = self.stdscr.getmaxyx()
+            progress_msg = "Loading analytics data..."
+            self.stdscr.clear()
+            self.stdscr.addstr(
+                height // 2, (width - len(progress_msg)) // 2, progress_msg
+            )
+            self.stdscr.refresh()
+
+            self._load_analytics_data()
+
+            # Step 1: Collect candidates filtered by Homebrew (fast), keep package data for later
+            progress_msg = "Filtering packages..."
+            self.stdscr.clear()
+            self.stdscr.addstr(
+                height // 2, (width - len(progress_msg)) // 2, progress_msg
+            )
+            self.stdscr.refresh()
+
+            candidate_packages = []  # List of dicts with name, category, analytics, data
+
+            # Collect formulae candidates (filtered by Homebrew only)
+            for formula in self.formulae_data:
+                name = formula["name"]
+                # Only check Homebrew installation (fast) - skip system binary check
+                if not self._is_package_installed(
+                    name, "Formulae", formula, check_system_binary=False
+                ):
+                    analytics_30d = (
+                        self._formulae_analytics.get(name, 0)
+                        if self._formulae_analytics
+                        else 0
+                    )
+                    candidate_packages.append(
+                        {
+                            "name": name,
+                            "category": "Formulae",
+                            "analytics_30d": analytics_30d,
+                            "data": formula,
+                        }
+                    )
+
+            # Collect casks candidates (filtered by Homebrew only)
+            for cask in self.casks_data:
+                name = cask["token"]
+                # Only check Homebrew installation (fast) - skip system binary check
+                if not self._is_package_installed(
+                    name, "Casks", cask, check_system_binary=False
+                ):
+                    analytics_30d = (
+                        self._casks_analytics.get(name, 0)
+                        if self._casks_analytics
+                        else 0
+                    )
+                    candidate_packages.append(
+                        {
+                            "name": name,
+                            "category": "Casks",
+                            "analytics_30d": analytics_30d,
+                            "data": cask,
+                        }
+                    )
+
+            # Step 2: Sort by analytics (descending)
+            candidate_packages.sort(key=lambda p: p["analytics_30d"], reverse=True)
+
+            # Step 3: Incrementally check system binaries until we have enough
+            progress_msg = "Checking system binaries..."
+            self.stdscr.clear()
+            self.stdscr.addstr(
+                height // 2, (width - len(progress_msg)) // 2, progress_msg
+            )
+            self.stdscr.refresh()
+
+            final_packages = []
+            checked_count = 0
+
+            for candidate in candidate_packages:
+                if len(final_packages) >= limit:
+                    break
+
+                # Check system binary for this candidate
+                installed = self._is_package_installed(
+                    candidate["name"],
+                    candidate["category"],
+                    candidate["data"],
+                    check_system_binary=True,
+                )
+
+                checked_count += 1
+
+                # Update progress every 25 packages
+                if checked_count % 25 == 0:
+                    progress = f"Checked {checked_count} packages, found {len(final_packages)} uninstalled..."
+                    try:
+                        self.stdscr.clear()
+                        self.stdscr.addstr(
+                            height // 2, (width - len(progress)) // 2, progress
+                        )
+                        self.stdscr.refresh()
+                    except Exception:
+                        pass
+
+                # If not installed (neither Homebrew nor system), add to final list
+                if not installed:
+                    final_packages.append(
+                        BrewPackage(
+                            name=candidate["name"],
+                            category=candidate["category"],
+                            installed=False,
+                            analytics_30d=candidate["analytics_30d"],
+                        )
+                    )
+
+            # Convert to BrewPackage list (should already be limited, but be safe)
+            self.packages = final_packages[:limit]
+
+        except Exception as e:
+            print(f"Error loading top packages: {str(e)}")
+            self.packages = []
 
     def get_package_info(self, package: BrewPackage) -> PackageInfo:
         """Fetch package information using the Homebrew API."""
@@ -363,9 +651,74 @@ class BrewInteractive:
                 name=package.name, description=f"Error fetching info: {str(e)}"
             )
 
-    def _is_installed(self, package_data: dict) -> bool:
-        """Return True if the package appears installed via Homebrew."""
+    def _check_system_binary(self, binary_name: str) -> bool:
+        """Check if a binary exists on the system using 'which' command."""
+        if binary_name in self._system_binary_cache:
+            return self._system_binary_cache[binary_name]
+
         try:
+            result = subprocess.run(
+                ["which", binary_name],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            exists = result.returncode == 0
+            self._system_binary_cache[binary_name] = exists
+            return exists
+        except Exception:
+            # If which fails, assume it doesn't exist
+            self._system_binary_cache[binary_name] = False
+            return False
+
+    def _get_package_binaries(self, package_data: dict) -> List[str]:
+        """Extract binary names that a package provides."""
+        binaries = []
+        package_name = None
+
+        # Get package name
+        if "token" in package_data:  # cask
+            package_name = package_data.get("token")
+        else:  # formula
+            package_name = package_data.get("name") or package_data.get("full_name")
+
+        if not package_name:
+            return binaries
+
+        # Many packages install a binary with the same name as the package
+        binaries.append(package_name)
+
+        # Check if package provides additional binaries
+        # Formulae often have a "bin" array or "installed" array with binaries
+        if "installed" in package_data:
+            installed = package_data["installed"]
+            if isinstance(installed, list):
+                for item in installed:
+                    if isinstance(item, dict):
+                        # Check for binary paths
+                        bin_path = item.get("file") or item.get("path")
+                        if bin_path:
+                            # Extract binary name from path (e.g., "/usr/local/bin/git" -> "git")
+                            bin_name = Path(bin_path).name
+                            if bin_name not in binaries:
+                                binaries.append(bin_name)
+
+        # Also check for explicit bin array (some packages list binaries)
+        if "bin" in package_data:
+            bin_list = package_data["bin"]
+            if isinstance(bin_list, list):
+                for bin_item in bin_list:
+                    if isinstance(bin_item, str):
+                        bin_name = Path(bin_item).name
+                        if bin_name not in binaries:
+                            binaries.append(bin_name)
+
+        return binaries
+
+    def _is_installed(self, package_data: dict) -> bool:
+        """Return True if the package appears installed via Homebrew or as a system binary."""
+        try:
+            # First check Homebrew installation
             # Determine package type using Homebrew API schema:
             # - Casks use 'token'
             # - Formulae use 'name' (or 'full_name')
@@ -378,9 +731,27 @@ class BrewInteractive:
                     return False
                 cmd = ["brew", "list", "--formula", package_name]
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            return result.returncode == 0
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                return True
+
+            # If not installed via Homebrew, check if binary exists on system
+            # This catches cases like git installed via Xcode Command Line Tools
+            binaries = self._get_package_binaries(package_data)
+            for binary_name in binaries:
+                if self._check_system_binary(binary_name):
+                    return True
+
+            return False
         except Exception:
+            # If checks fail, try system binary check as fallback
+            try:
+                binaries = self._get_package_binaries(package_data)
+                for binary_name in binaries:
+                    if self._check_system_binary(binary_name):
+                        return True
+            except Exception:
+                pass
             return False
 
     def draw_screen(self, stdscr) -> None:
@@ -411,11 +782,19 @@ class BrewInteractive:
 
     def draw_search_results(self, stdscr, height: int, width: int) -> None:
         """Draw the search results screen."""
-        current_line = self.draw_header(stdscr, "Brewse: Homebrew Search", width)
+        if self.showing_top_packages:
+            title = "Brewse: Top Packages (Not Installed)"
+        else:
+            title = "Brewse: Homebrew Search"
+        current_line = self.draw_header(stdscr, title, width)
 
         # Draw search term and result count
-        search_info = f"Search Results for '{self.search_term}'"
-        count_info = f"({len(self.packages)} found)"
+        if self.showing_top_packages:
+            search_info = "Top packages by popularity (30-day installs)"
+            count_info = f"({len(self.packages)} shown)"
+        else:
+            search_info = f"Search Results for '{self.search_term}'"
+            count_info = f"({len(self.packages)} found)"
 
         stdscr.addstr(current_line, 2, search_info)
         # Add count in gray (using dim attribute)
@@ -425,8 +804,12 @@ class BrewInteractive:
         # Calculate available lines for results
         available_lines = height - current_line - 1  # -1 for footer
 
-        # Sort all packages together alphabetically
-        self.packages.sort(key=lambda p: p.name.lower())
+        # Sort packages: by analytics if showing top packages, otherwise alphabetically
+        if self.showing_top_packages:
+            # Already sorted by analytics_30d in load_top_packages
+            pass
+        else:
+            self.packages.sort(key=lambda p: p.name.lower())
 
         # Adjust scroll_offset to keep selected item visible
         visible_area = available_lines - 2  # Account for search term line
@@ -453,6 +836,12 @@ class BrewInteractive:
                     "(formula)" if package.category == "Formulae" else "(cask)"
                 )
 
+                # Format package line with analytics if showing top packages
+                if self.showing_top_packages and package.analytics_30d > 0:
+                    analytics_suffix = f" ({package.analytics_30d:,} installs)"
+                else:
+                    analytics_suffix = ""
+
                 if current_package_idx == self.selected_index:
                     # Selected line
                     stdscr.addstr(
@@ -461,7 +850,7 @@ class BrewInteractive:
                     stdscr.addstr(
                         current_line,
                         4 + len(prefix + package.name) + 1,
-                        category_suffix,
+                        category_suffix + analytics_suffix,
                         curses.A_REVERSE | curses.A_DIM,
                     )
                 else:
@@ -470,7 +859,7 @@ class BrewInteractive:
                     stdscr.addstr(
                         current_line,
                         4 + len(prefix + package.name) + 1,
-                        category_suffix,
+                        category_suffix + analytics_suffix,
                         curses.A_DIM,
                     )
 
@@ -479,7 +868,10 @@ class BrewInteractive:
             visible_line += 1
 
         # Update footer
-        footer = "↑/↓: Navigate | Enter: Show Info | q: Quit | i: Install | n: New Search | h: Help"
+        if self.showing_top_packages:
+            footer = "↑/↓: Navigate | Enter: Show Info | q: Quit | i: Install | /: Search | h: Help"
+        else:
+            footer = "↑/↓: Navigate | Enter: Show Info | q: Quit | i: Install | n: New Search | t: Top Packages | h: Help"
         try:
             stdscr.addstr(height - 1, 0, footer[: width - 1], curses.A_BOLD)
         except curses.error:
@@ -511,7 +903,12 @@ class BrewInteractive:
                 pass
 
         # Add installed status at the top of the info
-        add_line("Status", "✔ Installed" if info.installed else "Not installed")
+        if self.operation_in_progress == "installing":
+            add_line("Status", "Installing...")
+        elif self.operation_in_progress == "uninstalling":
+            add_line("Status", "Uninstalling...")
+        else:
+            add_line("Status", "✔ Installed" if info.installed else "Not installed")
 
         if info.version:
             add_line("Version", info.version)
@@ -526,7 +923,10 @@ class BrewInteractive:
                 add_line(f"  {period}", f"{count} installs")
 
         # Update the footer text to include uninstall option and help
-        footer = "←: Back | i: Install | u: Uninstall | h: Help | q: Quit"
+        if self.operation_in_progress:
+            footer = "←: Back | h: Help | q: Quit (Operation in progress...)"
+        else:
+            footer = "←: Back | i: Install | u: Uninstall | h: Help | q: Quit"
         try:
             stdscr.addstr(height - 1, 0, footer[: width - 1], curses.A_BOLD)
         except curses.error:
@@ -550,6 +950,8 @@ class BrewInteractive:
             "  PgUp/PgDn Page up/down",
             "  Enter     Show package info",
             "  i         Install selected",
+            "  t         Show top packages",
+            "  / or n    New search",
             "",
             "Info view:",
             "  ←         Back to results",
@@ -576,12 +978,21 @@ class BrewInteractive:
 
     def install_package(self) -> None:
         """Install the currently selected package."""
+        # Block if another operation is in progress
+        if self.operation_in_progress:
+            return
+
         if self.view_mode == "search":
             package = self.packages[self.selected_index]
         else:
             package = next(
                 p for p in self.packages if p.name == self.current_package_info.name
             )
+
+        # Set operation flag and refresh screen
+        self.operation_in_progress = "installing"
+        self.draw_screen(self.stdscr)
+        self.stdscr.refresh()
 
         # Temporarily leave curses input echo for command execution output capture
         try:
@@ -597,6 +1008,9 @@ class BrewInteractive:
         except Exception as e:
             success = False
             message = f"Install error: {e}"
+        finally:
+            # Clear operation flag
+            self.operation_in_progress = None
 
         # Refresh installed status
         try:
@@ -617,6 +1031,9 @@ class BrewInteractive:
         except Exception:
             pass
 
+        # Refresh screen to show updated status
+        self.draw_screen(self.stdscr)
+
         # Show transient message at footer area
         try:
             height, width = self.stdscr.getmaxyx()
@@ -629,12 +1046,21 @@ class BrewInteractive:
 
     def uninstall_package(self) -> None:
         """Uninstall the currently selected package."""
+        # Block if another operation is in progress
+        if self.operation_in_progress:
+            return
+
         if self.view_mode == "search":
             package = self.packages[self.selected_index]
         else:
             package = next(
                 p for p in self.packages if p.name == self.current_package_info.name
             )
+
+        # Set operation flag and refresh screen
+        self.operation_in_progress = "uninstalling"
+        self.draw_screen(self.stdscr)
+        self.stdscr.refresh()
 
         try:
             result = subprocess.run(
@@ -649,6 +1075,9 @@ class BrewInteractive:
         except Exception as e:
             success = False
             message = f"Uninstall error: {e}"
+        finally:
+            # Clear operation flag
+            self.operation_in_progress = None
 
         # Refresh installed status
         try:
@@ -668,6 +1097,9 @@ class BrewInteractive:
                     )
         except Exception:
             pass
+
+        # Refresh screen to show updated status
+        self.draw_screen(self.stdscr)
 
         # Show transient message
         try:
@@ -698,13 +1130,23 @@ class BrewInteractive:
                 self.request_search_input = True
             return True
         elif key == ord("i"):
-            self.install_package()  # This will now handle everything including exit
+            if not self.operation_in_progress:
+                self.install_package()  # This will now handle everything including exit
         elif key == ord("u"):
-            self.uninstall_package()  # This will now handle everything including exit
+            if not self.operation_in_progress:
+                self.uninstall_package()  # This will now handle everything including exit
         elif key == ord("/"):  # Quick search
             self.scroll_offset = 0
             self.selected_index = 0
+            self.showing_top_packages = False
             self.request_search_input = True
+            return True
+        elif key == ord("t"):  # Show top packages
+            if self.view_mode == "search":
+                self.scroll_offset = 0
+                self.selected_index = 0
+                self.showing_top_packages = True
+                self.load_top_packages(limit=100)
             return True
         elif key == ord("h"):  # Show help
             self.view_mode = "help"
@@ -716,6 +1158,7 @@ class BrewInteractive:
         elif self.view_mode == "search" and key == ord("n"):
             self.scroll_offset = 0  # Reset scroll offset
             self.selected_index = 0
+            self.showing_top_packages = False
             self.request_search_input = True
             return True
         elif self.view_mode == "search":
@@ -752,8 +1195,21 @@ class BrewInteractive:
 
         return True
 
-    def main(self, stdscr, search_term: Optional[str]) -> None:
-        """Main application loop."""
+    def main(
+        self,
+        stdscr,
+        search_term: Optional[str],
+        show_top_packages: bool = False,
+        top_limit: int = 100,
+    ) -> None:
+        """Main application loop.
+
+        Args:
+            stdscr: Curses standard screen
+            search_term: Optional search term to use immediately
+            show_top_packages: If True, show top packages instead of search
+            top_limit: Number of top packages to show
+        """
         self.stdscr = stdscr
         self.search_term = search_term
         # Reset position when starting new search
@@ -775,11 +1231,26 @@ class BrewInteractive:
             thread.daemon = True
             thread.start()
 
-        if search_term is None:
+        if show_top_packages:
+            # Show top packages directly
+            self.showing_top_packages = True
+            self.load_top_packages(limit=top_limit)
+        elif search_term is None:
+            # Show mode selection/search prompt
             search_input = self._search_input_flow(stdscr)
-            if search_input:
+            if search_input == "TOP_PACKAGES":
+                # User selected top packages mode
+                self.showing_top_packages = True
+                self.load_top_packages(limit=100)
+            elif search_input:
+                # User entered a search term
+                self.showing_top_packages = False
                 self.run_brew_search(search_input)
+            else:
+                # User cancelled, exit
+                return
         else:
+            self.showing_top_packages = False
             self.run_brew_search(search_term)
 
         # Continue with the rest of the UI loop
@@ -789,13 +1260,14 @@ class BrewInteractive:
                 self.request_search_input = False
                 search_input = self._search_input_flow(stdscr)
                 if search_input:
+                    self.showing_top_packages = False
                     self.run_brew_search(search_input)
             self.draw_screen(stdscr)
             if not self.handle_input(stdscr):
                 break
 
     def _search_input_flow(self, stdscr) -> Optional[str]:
-        """Render search prompt and collect input; return the term or None."""
+        """Render mode selection/search prompt and collect input; return the term, 'TOP_PACKAGES', or None."""
         height, width = stdscr.getmaxyx()
         title = "Brewse: Homebrew Search"
         input_width = 30  # Define fixed input width
@@ -804,6 +1276,12 @@ class BrewInteractive:
         stdscr.timeout(100)  # 100ms timeout
         curses.curs_set(1)  # Show cursor
 
+        # Mode selection: 0 = Search, 1 = Top Packages
+        selected_mode = 0
+        search_input = ""
+        search_submitted = False
+        user_modified_after_submit = False
+
         while True:
             stdscr.clear()
 
@@ -811,40 +1289,47 @@ class BrewInteractive:
             self.draw_header(stdscr, title, width)
 
             # Center the content vertically
-            content_start = (height - 6) // 2
+            content_start = (height - 8) // 2
 
-            # Draw prompt with a box around it
-            prompt = "Search anywhere in name:"
-            prompt_x = (width - len(prompt)) // 2  # Center the prompt
-            input_x = (width - input_width) // 2  # Center the input field
+            # Draw mode selection options
+            mode_options = [
+                ("Search packages", "Search anywhere in name"),
+                ("Top packages", "Show most popular packages not installed"),
+            ]
 
-            # Initialize input variables
-            search_input = ""
-            search_submitted = False
-            user_modified_after_submit = False
+            # Draw mode selection
+            mode_y = content_start
+            for idx, (mode_title, mode_desc) in enumerate(mode_options):
+                mode_x = (width - len(mode_title)) // 2
+                if idx == selected_mode:
+                    # Selected mode - highlight it
+                    stdscr.addstr(
+                        mode_y, mode_x, mode_title, curses.A_REVERSE | curses.A_BOLD
+                    )
+                    # Show description below
+                    desc_x = (width - len(mode_desc)) // 2
+                    stdscr.addstr(mode_y + 1, desc_x, mode_desc, curses.A_DIM)
+                else:
+                    stdscr.addstr(mode_y, mode_x, mode_title, curses.A_DIM)
+                mode_y += 3
 
-            # Define instructions
-            instructions = ["Press Enter to search", "Press Ctrl+C to quit"]
+            # If Search mode is selected, show input field
+            if selected_mode == 0:
+                prompt = "Search anywhere in name:"
+                prompt_x = (width - len(prompt)) // 2
+                input_x = (width - input_width) // 2
 
-            # Draw prompt above the input field
-            stdscr.addstr(content_start, prompt_x, prompt)
+                # Draw prompt above the input field
+                stdscr.addstr(mode_y, prompt_x, prompt)
 
-            while True:
-                stdscr.clear()
-
-                # Redraw header
-                self.draw_header(stdscr, title, width)
-                stdscr.addstr(content_start, prompt_x, prompt)
-
-                # Determine if we should gray out the input (search submitted but not modified)
+                # Draw the input field
                 input_style = curses.A_UNDERLINE
                 text_style = curses.A_NORMAL
                 if search_submitted and not user_modified_after_submit:
                     text_style = curses.A_DIM
 
-                # Redraw the input field with a line of spacing
                 stdscr.addstr(
-                    content_start + 2,
+                    mode_y + 2,
                     input_x,
                     " " * input_width,
                     input_style,
@@ -853,126 +1338,152 @@ class BrewInteractive:
                 # Center the text within the input field
                 if search_input:
                     text_start = input_x + (input_width - len(search_input)) // 2
-                    stdscr.addstr(
-                        content_start + 2, text_start, search_input, text_style
-                    )
+                    stdscr.addstr(mode_y + 2, text_start, search_input, text_style)
                     cursor_x = text_start + len(search_input)
                 else:
                     cursor_x = input_x + (input_width // 2)
+            else:
+                # Top Packages mode - no input field
+                cursor_x = 0
 
-                # Draw instructions centered (unless search is submitted)
-                if not search_submitted:
-                    for i, instruction in enumerate(instructions):
-                        instr_x = (width - len(instruction)) // 2
-                        stdscr.addstr(content_start + 4 + i, instr_x, instruction)
-                else:
-                    # Show "search queued" message
+            # Draw instructions
+            if selected_mode == 0:
+                if search_submitted and not user_modified_after_submit:
                     if user_modified_after_submit:
-                        queued_msg = "Press Enter again to update search"
-                        queued_x = (width - len(queued_msg)) // 2
-                        stdscr.addstr(
-                            content_start + 4, queued_x, queued_msg, curses.A_DIM
-                        )
+                        instructions = ["Press Enter again to update search"]
                     else:
-                        queued_msg = (
+                        instructions = [
                             f"Search queued: '{search_input}' - waiting for data..."
-                        )
-                        queued_x = (width - len(queued_msg)) // 2
-                        stdscr.addstr(
-                            content_start + 4, queued_x, queued_msg, curses.A_DIM
-                        )
+                        ]
+                else:
+                    instructions = ["↑/↓: Switch mode | Enter: Search | Ctrl+C: Quit"]
+            else:
+                instructions = [
+                    "↑/↓: Switch mode | Enter: Show top packages | Ctrl+C: Quit"
+                ]
 
-                # Show loading progress if downloading
-                if self.is_loading and not self.is_data_loaded:
-                    with self.progress_lock:
-                        current = self.download_progress["current"]
-                        total = self.download_progress["total"]
+            instr_y = mode_y + 5
+            for i, instruction in enumerate(instructions):
+                instr_x = (width - len(instruction)) // 2
+                if i == 0 and (search_submitted and not user_modified_after_submit):
+                    stdscr.addstr(instr_y + i, instr_x, instruction, curses.A_DIM)
+                else:
+                    stdscr.addstr(instr_y + i, instr_x, instruction)
 
-                    # Use bold style if search is submitted, dim if just loading
-                    progress_style = curses.A_BOLD if search_submitted else curses.A_DIM
+            # Show loading progress if downloading
+            if self.is_loading and not self.is_data_loaded:
+                with self.progress_lock:
+                    current = self.download_progress["current"]
+                    total = self.download_progress["total"]
 
-                    if total > 0:
-                        # Show progress bar
-                        percent = (current / total) * 100
-                        current_mb = current / (1024 * 1024)
-                        total_mb = total / (1024 * 1024)
+                # Use bold style if search is submitted, dim if just loading
+                progress_style = curses.A_BOLD if search_submitted else curses.A_DIM
 
-                        progress_text = f"Downloading package data: {current_mb:.1f} / {total_mb:.1f} MB ({percent:.0f}%)"
-                        progress_x = (width - len(progress_text)) // 2
+                if total > 0:
+                    # Show progress bar
+                    percent = (current / total) * 100
+                    current_mb = current / (1024 * 1024)
+                    total_mb = total / (1024 * 1024)
 
-                        # Position below instructions with extra spacing
-                        progress_y = content_start + 7
-                        if progress_y < height - 2:
-                            try:
-                                stdscr.addstr(
-                                    progress_y,
-                                    progress_x,
-                                    progress_text,
-                                    progress_style,
-                                )
+                    progress_text = f"Downloading package data: {current_mb:.1f} / {total_mb:.1f} MB ({percent:.0f}%)"
+                    progress_x = (width - len(progress_text)) // 2
 
-                                # Draw progress bar
-                                bar_width = min(50, width - 10)
-                                bar_x = (width - bar_width) // 2
-                                filled = int(bar_width * (current / total))
-                                bar = "█" * filled + "░" * (bar_width - filled)
-                                stdscr.addstr(
-                                    progress_y + 1, bar_x, bar, progress_style
-                                )
-                            except curses.error:
-                                pass
-                    else:
-                        # Just show loading message
-                        loading_text = "Preparing download..."
-                        loading_x = (width - len(loading_text)) // 2
-                        progress_y = content_start + 7
-                        if progress_y < height - 2:
-                            try:
-                                stdscr.addstr(
-                                    progress_y, loading_x, loading_text, progress_style
-                                )
-                            except curses.error:
-                                pass
-                elif self.is_data_loaded:
-                    # If search was submitted and data is now loaded, execute the search
-                    if search_submitted and not user_modified_after_submit:
-                        stdscr.timeout(-1)  # Reset to blocking
-                        curses.curs_set(0)
-                        return search_input
-
-                    # Show ready message
-                    ready_text = "✓ Ready to search"
-                    ready_x = (width - len(ready_text)) // 2
-                    progress_y = content_start + 7
+                    # Position below instructions with extra spacing
+                    progress_y = instr_y + len(instructions) + 1
                     if progress_y < height - 2:
                         try:
-                            stdscr.addstr(progress_y, ready_x, ready_text, curses.A_DIM)
+                            stdscr.addstr(
+                                progress_y,
+                                progress_x,
+                                progress_text,
+                                progress_style,
+                            )
+
+                            # Draw progress bar
+                            bar_width = min(50, width - 10)
+                            bar_x = (width - bar_width) // 2
+                            filled = int(bar_width * (current / total))
+                            bar = "█" * filled + "░" * (bar_width - filled)
+                            stdscr.addstr(progress_y + 1, bar_x, bar, progress_style)
                         except curses.error:
                             pass
-
-                # Move cursor to correct position
-                stdscr.move(content_start + 2, cursor_x)
-                stdscr.refresh()
-
-                # Get input (non-blocking with timeout)
-                try:
-                    ch = stdscr.getch()
-                except KeyboardInterrupt:
+                else:
+                    # Just show loading message
+                    loading_text = "Preparing download..."
+                    loading_x = (width - len(loading_text)) // 2
+                    progress_y = instr_y + len(instructions) + 1
+                    if progress_y < height - 2:
+                        try:
+                            stdscr.addstr(
+                                progress_y, loading_x, loading_text, progress_style
+                            )
+                        except curses.error:
+                            pass
+            elif self.is_data_loaded:
+                # If search was submitted and data is now loaded, execute the search
+                if (
+                    search_submitted
+                    and not user_modified_after_submit
+                    and selected_mode == 0
+                ):
                     stdscr.timeout(-1)  # Reset to blocking
                     curses.curs_set(0)
-                    return None
+                    return search_input
 
-                # If no input (timeout), continue loop to update progress
-                if ch == -1:
-                    continue
+                # Show ready message
+                ready_text = "✓ Ready"
+                ready_x = (width - len(ready_text)) // 2
+                progress_y = instr_y + len(instructions) + 1
+                if progress_y < height - 2:
+                    try:
+                        stdscr.addstr(progress_y, ready_x, ready_text, curses.A_DIM)
+                    except curses.error:
+                        pass
 
-                # Handle Ctrl+C to quit
-                if ch == 3:  # Ctrl+C
-                    stdscr.timeout(-1)  # Reset to blocking
-                    curses.curs_set(0)
-                    return None
+            # Move cursor to correct position (only if in search mode)
+            if selected_mode == 0:
+                stdscr.move(mode_y + 2, cursor_x)
+            stdscr.refresh()
 
-                if ch in (curses.KEY_ENTER, 10, 13):  # Enter key
+            # Get input (non-blocking with timeout)
+            try:
+                ch = stdscr.getch()
+            except KeyboardInterrupt:
+                stdscr.timeout(-1)  # Reset to blocking
+                curses.curs_set(0)
+                return None
+
+            # If no input (timeout), continue loop to update progress
+            if ch == -1:
+                continue
+
+            # Handle Ctrl+C to quit
+            if ch == 3:  # Ctrl+C
+                stdscr.timeout(-1)  # Reset to blocking
+                curses.curs_set(0)
+                return None
+
+            # Handle mode navigation
+            if ch == curses.KEY_UP:
+                selected_mode = 0
+                search_submitted = False
+                user_modified_after_submit = False
+            elif ch == curses.KEY_DOWN:
+                selected_mode = 1
+                search_submitted = False
+                user_modified_after_submit = False
+            elif ch in (curses.KEY_ENTER, 10, 13):  # Enter key
+                if selected_mode == 1:
+                    # Top Packages mode selected
+                    if self.is_data_loaded:
+                        stdscr.timeout(-1)  # Reset to blocking
+                        curses.curs_set(0)
+                        return "TOP_PACKAGES"
+                    else:
+                        # Wait for data to load
+                        continue
+                elif selected_mode == 0:
+                    # Search mode
                     if search_input:
                         # Check if data is already loaded
                         if self.is_data_loaded:
@@ -984,7 +1495,8 @@ class BrewInteractive:
                             # Mark as submitted but allow editing
                             search_submitted = True
                             user_modified_after_submit = False
-                elif ch in (curses.KEY_BACKSPACE, 127, 8):  # Backspace
+            elif selected_mode == 0:  # Only handle text input in search mode
+                if ch in (curses.KEY_BACKSPACE, 127, 8):  # Backspace
                     if search_input:
                         search_input = search_input[:-1]
                         if search_submitted:
@@ -1020,6 +1532,14 @@ def main():
     parser.add_argument(
         "--clear-cache", action="store_true", help="Clear all cached data and exit"
     )
+    parser.add_argument(
+        "--top",
+        type=int,
+        metavar="N",
+        nargs="?",
+        const=100,
+        help="Show top N popular packages not installed (default: 100)",
+    )
 
     args = parser.parse_args()
 
@@ -1036,8 +1556,15 @@ def main():
     # Create app with force_refresh flag
     app = BrewInteractive(force_refresh=args.refresh)
 
-    # Run with or without search term
-    if args.search_term:
+    # Run with top packages, search term, or interactive mode
+    if args.top is not None:
+        # Show top packages directly
+        curses.wrapper(
+            lambda stdscr: app.main(
+                stdscr, None, show_top_packages=True, top_limit=args.top
+            )
+        )
+    elif args.search_term:
         curses.wrapper(lambda stdscr: app.main(stdscr, args.search_term))
     else:
         curses.wrapper(lambda stdscr: app.main(stdscr, None))
