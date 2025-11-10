@@ -2,20 +2,6 @@
 
 An interactive TUI (Terminal User Interface) browser for Homebrew packages. Brewse provides a fast, user-friendly way to search, view, and install or uninstall Homebrew packages.
 
-## Quick Start
-
-Try it instantly without installing:
-
-```bash
-uvx brewse
-```
-
-Or search directly:
-
-```bash
-uvx brewse python
-```
-
 ## Features
 
 - Interactive search interface for both Formulae and Casks
@@ -32,25 +18,7 @@ uvx brewse python
 
 ## Installation
 
-### Option 1: Using pip (recommended for permanent installation)
-
-```bash
-pip install brewse
-```
-
-### Option 2: Using pipx (isolated environment)
-
-```bash
-pipx install brewse
-```
-
-### Option 3: Using uvx (run without installing)
-
-```bash
-uvx brewse
-```
-
-### Option 4: Using Homebrew (custom tap)
+### Option 1: Using Homebrew (recommended)
 
 ```bash
 brew tap jonasjancarik/brewse
@@ -61,6 +29,32 @@ Or install directly from the tap URL:
 
 ```bash
 brew install jonasjancarik/brewse/brewse
+```
+
+### Option 2: Using uvx (run without installing)
+
+Try brewse instantly without installation:
+
+```bash
+uvx brewse
+```
+
+**Note:** Requires [uv](https://docs.astral.sh/uv/) to be installed. You can install it with:
+
+```bash
+brew install uv
+```
+
+### Option 3: Using pip
+
+```bash
+pip install brewse
+```
+
+### Option 4: Using pipx (isolated environment)
+
+```bash
+pipx install brewse
 ```
 
 ## Usage
