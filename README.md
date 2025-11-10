@@ -96,6 +96,40 @@ brewse --clear-cache     # Clear all cached data and exit
 
 Brewse caches package data in `~/.cache/brewse/` to improve performance. Cache entries expire after 24 hours.
 
+## Development & Releases
+
+### Release Process
+
+Brewse uses automated releases with GitHub Actions:
+
+1. **Update version** in `pyproject.toml` and `src/brewse/__init__.py`
+2. **Build and publish to PyPI:**
+   ```bash
+   uv build
+   uv publish
+   ```
+3. **Create a GitHub release:**
+   ```bash
+   gh release create v0.1.3 --generate-notes
+   ```
+
+The GitHub Action will automatically:
+- Download the tarball from PyPI
+- Calculate the SHA256 hash
+- Update the Homebrew tap formula
+- Push changes to the `homebrew-brewse` repository
+
+See [.github/AUTOMATION_SETUP.md](.github/AUTOMATION_SETUP.md) for setup details.
+
+### Manual Tap Update
+
+If needed, you can manually update the Homebrew tap:
+
+```bash
+cd ~/homebrew-brewse
+./update-formula.sh 0.1.3
+```
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
