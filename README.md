@@ -14,6 +14,7 @@ An interactive TUI (Terminal User Interface) browser for Homebrew packages. Brew
 - Quick installation/uninstallation of packages
 - Keyboard-driven navigation
 - Local caching of package data for faster subsequent searches
+- Real-time download progress indicator with visual progress bar
 
 ## Installation
 
@@ -28,18 +29,27 @@ pip install brewse
 Launch Brewse in one of two ways:
 
 1. Interactive search mode:
-```
+```bash
 brewse
 ```
 
 2. Direct search mode:
-```
+```bash
 brewse <search-term>
+```
+
+### Command-line Options
+
+```bash
+brewse --help            # Show all available options
+brewse --version         # Show version number
+brewse --refresh         # Force refresh of cached package data
+brewse --clear-cache     # Clear all cached data and exit
 ```
 
 ## Requirements
 
-- Python 3.6+
+- Python 3.7+
 - Homebrew
 - Internet connection
 

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import sys
 import subprocess
 import curses
 from dataclasses import dataclass
@@ -11,8 +10,9 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import threading
 import time
-import termios
-import tty
+import argparse
+import shutil
+# termios and tty previously used for manual exit handling; no longer needed
 
 
 @dataclass
@@ -34,7 +34,7 @@ class PackageInfo:
 
 
 class BrewInteractive:
-    def __init__(self):
+    def __init__(self, force_refresh: bool = False):
         self.packages: List[BrewPackage] = []
         self.selected_index = 0
         self.scroll_offset = 0  # Add scroll offset tracking
@@ -47,6 +47,17 @@ class BrewInteractive:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.is_data_loaded = False
         self.is_loading = False
+        self.request_search_input = False  # Signal to re-open search prompt
+        # Progress tracking
+        self.download_progress = {"current": 0, "total": 0, "file": ""}
+        self.progress_lock = threading.Lock()
+        self.force_refresh = force_refresh
+        # Keep parsed data in memory to avoid re-parsing on each search
+        self.formulae_data = None
+        self.casks_data = None
+        # Cache installed packages lists
+        self._installed_formulae = None
+        self._installed_casks = None
 
     def _get_cache_path(self, url: str) -> Path:
         """Generate a cache file path from URL."""
@@ -56,12 +67,23 @@ class BrewInteractive:
         )
         return self.cache_dir / filename
 
-    def _fetch_json(self, url: str) -> dict:
+    def _get_file_size(self, url: str) -> int:
+        """Get file size using HEAD request."""
+        try:
+            req = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(req, timeout=10) as response:
+                content_length = response.headers.get("Content-Length")
+                return int(content_length) if content_length else 0
+        except Exception:
+            return 0
+
+    def _fetch_json(self, url: str, track_progress: bool = False) -> dict:
         """Helper method to fetch and parse JSON from URL with caching."""
         cache_path = self._get_cache_path(url)
 
         # Check if cache exists and is fresh (less than 24 hours old)
-        if cache_path.exists():
+        # Skip cache if force_refresh is enabled
+        if not self.force_refresh and cache_path.exists():
             with open(cache_path) as f:
                 cached_data = json.load(f)
                 cached_time = datetime.fromtimestamp(cached_data["timestamp"])
@@ -78,10 +100,38 @@ class BrewInteractive:
             )
             self.stdscr.refresh()
 
-        # Fetch fresh data
+        # Fetch fresh data with progress tracking
         try:
             with urllib.request.urlopen(url, timeout=120) as response:
-                data = json.loads(response.read())
+                if track_progress:
+                    # Get file size from response headers
+                    content_length = response.headers.get("Content-Length")
+                    file_size = int(content_length) if content_length else 0
+
+                    # Extract filename from URL
+                    filename = url.split("/")[-1]
+
+                    # Download in chunks and track progress
+                    data_bytes = b""
+                    chunk_size = 8192
+                    downloaded = 0
+
+                    while True:
+                        chunk = response.read(chunk_size)
+                        if not chunk:
+                            break
+                        data_bytes += chunk
+                        downloaded += len(chunk)
+
+                        # Update progress
+                        if file_size > 0:
+                            with self.progress_lock:
+                                self.download_progress["current"] += len(chunk)
+                                self.download_progress["file"] = filename
+
+                    data = json.loads(data_bytes)
+                else:
+                    data = json.loads(response.read())
         except urllib.error.URLError as e:
             raise Exception(
                 f"Network error: {e.reason}. Check your internet connection."
@@ -100,12 +150,83 @@ class BrewInteractive:
         """Load initial API data in background."""
         try:
             self.is_loading = True
-            # Fetch both datasets
-            self._fetch_json(f"{self.api_base_url}/formula.json")
-            self._fetch_json(f"{self.api_base_url}/cask.json")
+
+            # Get file sizes first
+            formula_url = f"{self.api_base_url}/formula.json"
+            cask_url = f"{self.api_base_url}/cask.json"
+
+            # Check if we need to download (not in cache or stale)
+            formula_cached = self._is_cache_fresh(formula_url)
+            cask_cached = self._is_cache_fresh(cask_url)
+
+            if not formula_cached or not cask_cached:
+                # Calculate total size for progress tracking
+                total_size = 0
+                if not formula_cached:
+                    total_size += self._get_file_size(formula_url)
+                if not cask_cached:
+                    total_size += self._get_file_size(cask_url)
+
+                with self.progress_lock:
+                    self.download_progress["total"] = total_size
+                    self.download_progress["current"] = 0
+
+            # Fetch both datasets with progress tracking and keep in memory
+            self.formulae_data = self._fetch_json(
+                formula_url, track_progress=not formula_cached
+            )
+            self.casks_data = self._fetch_json(cask_url, track_progress=not cask_cached)
             self.is_data_loaded = True
         finally:
             self.is_loading = False
+
+    def _is_cache_fresh(self, url: str) -> bool:
+        """Check if cache exists and is fresh."""
+        if self.force_refresh:
+            return False
+
+        cache_path = self._get_cache_path(url)
+        if cache_path.exists():
+            try:
+                with open(cache_path) as f:
+                    cached_data = json.load(f)
+                    cached_time = datetime.fromtimestamp(cached_data["timestamp"])
+                    return datetime.now() - cached_time < timedelta(hours=24)
+            except Exception:
+                return False
+        return False
+
+    def _get_installed_packages(self):
+        """Get all installed packages once and cache them."""
+        if self._installed_formulae is None:
+            try:
+                result = subprocess.run(
+                    ["brew", "list", "--formula"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    self._installed_formulae = set(result.stdout.strip().split("\n"))
+                else:
+                    self._installed_formulae = set()
+            except Exception:
+                self._installed_formulae = set()
+
+        if self._installed_casks is None:
+            try:
+                result = subprocess.run(
+                    ["brew", "list", "--cask"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    self._installed_casks = set(result.stdout.strip().split("\n"))
+                else:
+                    self._installed_casks = set()
+            except Exception:
+                self._installed_casks = set()
 
     def run_brew_search(self, term: str) -> None:
         """Search packages using the Homebrew API."""
@@ -118,8 +239,10 @@ class BrewInteractive:
             if not self.is_loading:
                 # If not currently loading, start the load
                 self.is_loading = True
-                self._fetch_json(f"{self.api_base_url}/formula.json")
-                self._fetch_json(f"{self.api_base_url}/cask.json")
+                self.formulae_data = self._fetch_json(
+                    f"{self.api_base_url}/formula.json"
+                )
+                self.casks_data = self._fetch_json(f"{self.api_base_url}/cask.json")
                 self.is_data_loaded = True
             else:
                 # Show loading message while waiting
@@ -133,31 +256,34 @@ class BrewInteractive:
                 time.sleep(0.1)  # Small delay to prevent CPU spinning
 
         try:
-            # Use cached data from the files
-            formulae = self._fetch_json(f"{self.api_base_url}/formula.json")
-            casks = self._fetch_json(f"{self.api_base_url}/cask.json")
+            # Get all installed packages once
+            self._get_installed_packages()
 
+            # Use in-memory data (already parsed)
             self.packages = []
+            term_lower = term.lower()
 
             # Search formulae
-            for formula in formulae:
-                if term.lower() in formula["name"].lower():
+            for formula in self.formulae_data:
+                if term_lower in formula["name"].lower():
+                    name = formula["name"]
                     self.packages.append(
                         BrewPackage(
-                            name=formula["name"],
+                            name=name,
                             category="Formulae",
-                            installed=self._is_installed(formula),
+                            installed=name in self._installed_formulae,
                         )
                     )
 
             # Search casks
-            for cask in casks:
-                if term.lower() in cask["token"].lower():
+            for cask in self.casks_data:
+                if term_lower in cask["token"].lower():
+                    name = cask["token"]
                     self.packages.append(
                         BrewPackage(
-                            name=cask["token"],
+                            name=name,
                             category="Casks",
-                            installed=self._is_installed(cask),
+                            installed=name in self._installed_casks,
                         )
                     )
 
@@ -238,23 +364,23 @@ class BrewInteractive:
             )
 
     def _is_installed(self, package_data: dict) -> bool:
-        """Helper method to check if a package is installed."""
+        """Return True if the package appears installed via Homebrew."""
         try:
-            result = subprocess.run(
-                [
-                    "brew",
-                    "list",
-                    "--formula" if package_data.get("formula") else "--cask",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            installed_packages = result.stdout.splitlines()
-            return (
-                # package_data.get("name", package_data.get("token", "")).lower()
-                package_data.get("token") in installed_packages
-            )
-        except subprocess.SubprocessError:
+            # Determine package type using Homebrew API schema:
+            # - Casks use 'token'
+            # - Formulae use 'name' (or 'full_name')
+            if "token" in package_data:  # cask
+                package_name = package_data.get("token")
+                cmd = ["brew", "list", "--cask", package_name]
+            else:  # formula
+                package_name = package_data.get("name") or package_data.get("full_name")
+                if not package_name:
+                    return False
+                cmd = ["brew", "list", "--formula", package_name]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            return result.returncode == 0
+        except Exception:
             return False
 
     def draw_screen(self, stdscr) -> None:
@@ -264,8 +390,10 @@ class BrewInteractive:
 
         if self.view_mode == "search":
             self.draw_search_results(stdscr, height, width)
-        else:  # info mode
+        elif self.view_mode == "info":  # info mode
             self.draw_package_info(stdscr, height, width)
+        elif self.view_mode == "help":
+            self.draw_help(stdscr, height, width)
 
         stdscr.refresh()
 
@@ -351,9 +479,7 @@ class BrewInteractive:
             visible_line += 1
 
         # Update footer
-        footer = (
-            "↑/↓: Navigate | Enter: Show Info | q: Quit | i: Install | n: New Search"
-        )
+        footer = "↑/↓: Navigate | Enter: Show Info | q: Quit | i: Install | n: New Search | h: Help"
         try:
             stdscr.addstr(height - 1, 0, footer[: width - 1], curses.A_BOLD)
         except curses.error:
@@ -399,8 +525,50 @@ class BrewInteractive:
             for period, count in info.analytics.items():
                 add_line(f"  {period}", f"{count} installs")
 
-        # Update the footer text to include uninstall option
-        footer = "←: Back | i: Install | u: Uninstall | q: Quit"
+        # Update the footer text to include uninstall option and help
+        footer = "←: Back | i: Install | u: Uninstall | h: Help | q: Quit"
+        try:
+            stdscr.addstr(height - 1, 0, footer[: width - 1], curses.A_BOLD)
+        except curses.error:
+            pass
+
+    def draw_help(self, stdscr, height: int, width: int) -> None:
+        """Draw the help screen with keybindings and tips."""
+        current_line = self.draw_header(stdscr, "Help", width)
+
+        lines = [
+            "Keybindings:",
+            "",
+            "General:",
+            "  q         Quit",
+            "  h or ?    Help",
+            "  / or n    New search",
+            "  ← or ⌫    Back",
+            "",
+            "Search view:",
+            "  ↑/↓       Navigate",
+            "  PgUp/PgDn Page up/down",
+            "  Enter     Show package info",
+            "  i         Install selected",
+            "",
+            "Info view:",
+            "  ←         Back to results",
+            "  i         Install",
+            "  u         Uninstall",
+            "",
+            f"Cache: {self.cache_dir}",
+        ]
+
+        for line in lines:
+            if current_line >= height - 2:
+                break
+            try:
+                stdscr.addstr(current_line, 2, line[: max(0, width - 4)])
+            except curses.error:
+                pass
+            current_line += 1
+
+        footer = "ESC/←/⌫: Back | q: Quit"
         try:
             stdscr.addstr(height - 1, 0, footer[: width - 1], curses.A_BOLD)
         except curses.error:
@@ -415,20 +583,49 @@ class BrewInteractive:
                 p for p in self.packages if p.name == self.current_package_info.name
             )
 
-        curses.endwin()  # End curses mode before running brew
-        subprocess.run(["brew", "install", package.name])
-        print("\nPress any key to exit...")
-        # Save terminal settings
-        old_settings = termios.tcgetattr(sys.stdin)
+        # Temporarily leave curses input echo for command execution output capture
         try:
-            # Set terminal to raw mode
-            tty.setraw(sys.stdin.fileno())
-            # Read a single character
-            sys.stdin.read(1)
-        finally:
-            # Restore terminal settings
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-        sys.exit(0)
+            result = subprocess.run(
+                ["brew", "install", package.name], capture_output=True, text=True
+            )
+            success = result.returncode == 0
+            message = (
+                f"Installed {package.name}"
+                if success
+                else f"Install failed: {result.stderr.strip()}"
+            )
+        except Exception as e:
+            success = False
+            message = f"Install error: {e}"
+
+        # Refresh installed status
+        try:
+            if success:
+                # Invalidate cached install lists to refresh on next search
+                if package.category == "Formulae":
+                    self._installed_formulae = None
+                else:
+                    self._installed_casks = None
+
+            if self.view_mode == "search":
+                package.installed = True if success else package.installed
+            else:
+                if self.current_package_info:
+                    self.current_package_info.installed = (
+                        True if success else self.current_package_info.installed
+                    )
+        except Exception:
+            pass
+
+        # Show transient message at footer area
+        try:
+            height, width = self.stdscr.getmaxyx()
+            self.stdscr.addstr(
+                height - 2, 0, (message[: width - 1]).ljust(width - 1), curses.A_BOLD
+            )
+            self.stdscr.refresh()
+        except Exception:
+            pass
 
     def uninstall_package(self) -> None:
         """Uninstall the currently selected package."""
@@ -439,20 +636,48 @@ class BrewInteractive:
                 p for p in self.packages if p.name == self.current_package_info.name
             )
 
-        curses.endwin()  # End curses mode before running brew
-        subprocess.run(["brew", "uninstall", package.name])
-        print("\nPress any key to exit...")
-        # Save terminal settings
-        old_settings = termios.tcgetattr(sys.stdin)
         try:
-            # Set terminal to raw mode
-            tty.setraw(sys.stdin.fileno())
-            # Read a single character
-            sys.stdin.read(1)
-        finally:
-            # Restore terminal settings
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-        sys.exit(0)
+            result = subprocess.run(
+                ["brew", "uninstall", package.name], capture_output=True, text=True
+            )
+            success = result.returncode == 0
+            message = (
+                f"Uninstalled {package.name}"
+                if success
+                else f"Uninstall failed: {result.stderr.strip()}"
+            )
+        except Exception as e:
+            success = False
+            message = f"Uninstall error: {e}"
+
+        # Refresh installed status
+        try:
+            if success:
+                # Invalidate cached install lists to refresh on next search
+                if package.category == "Formulae":
+                    self._installed_formulae = None
+                else:
+                    self._installed_casks = None
+
+            if self.view_mode == "search":
+                package.installed = False if success else package.installed
+            else:
+                if self.current_package_info:
+                    self.current_package_info.installed = (
+                        False if success else self.current_package_info.installed
+                    )
+        except Exception:
+            pass
+
+        # Show transient message
+        try:
+            height, width = self.stdscr.getmaxyx()
+            self.stdscr.addstr(
+                height - 2, 0, (message[: width - 1]).ljust(width - 1), curses.A_BOLD
+            )
+            self.stdscr.refresh()
+        except Exception:
+            pass
 
     def handle_input(self, stdscr) -> bool:
         """Handle user input. Returns False if should exit."""
@@ -467,9 +692,10 @@ class BrewInteractive:
                 self.current_package_info = None
             elif self.view_mode == "search":
                 self.scroll_offset = 0
-                stdscr.clear()
-                stdscr.refresh()
-                self.main(stdscr, None)
+                self.selected_index = 0
+                self.view_mode = "search"
+                self.current_package_info = None
+                self.request_search_input = True
             return True
         elif key == ord("i"):
             self.install_package()  # This will now handle everything including exit
@@ -477,7 +703,8 @@ class BrewInteractive:
             self.uninstall_package()  # This will now handle everything including exit
         elif key == ord("/"):  # Quick search
             self.scroll_offset = 0
-            self.main(stdscr, None)
+            self.selected_index = 0
+            self.request_search_input = True
             return True
         elif key == ord("h"):  # Show help
             self.view_mode = "help"
@@ -488,7 +715,8 @@ class BrewInteractive:
             )
         elif self.view_mode == "search" and key == ord("n"):
             self.scroll_offset = 0  # Reset scroll offset
-            self.main(stdscr, None)
+            self.selected_index = 0
+            self.request_search_input = True
             return True
         elif self.view_mode == "search":
             if key == curses.KEY_UP and self.selected_index > 0:
@@ -512,6 +740,15 @@ class BrewInteractive:
             if key == curses.KEY_LEFT:  # Add left arrow for consistency
                 self.view_mode = "search"
                 self.current_package_info = None
+        elif self.view_mode == "help":
+            if key in (curses.KEY_LEFT, 27) or key in (
+                ord("\b"),
+                curses.KEY_BACKSPACE,
+                127,
+                8,
+            ):
+                # ESC (27), Left, or Backspace exits help
+                self.view_mode = "search"
 
         return True
 
@@ -539,102 +776,271 @@ class BrewInteractive:
             thread.start()
 
         if search_term is None:
-            height, width = stdscr.getmaxyx()
-            title = "Brewse: Homebrew Search"
-            input_width = 30  # Define fixed input width
-
-            while True:
-                stdscr.clear()
-
-                # Draw fancy border
-                self.draw_header(stdscr, title, width)
-
-                # Center the content vertically
-                content_start = (height - 6) // 2
-
-                # Draw prompt with a box around it
-                prompt = "Search anywhere in name:"
-                prompt_x = (width - len(prompt)) // 2  # Center the prompt
-                input_x = (width - input_width) // 2  # Center the input field
-
-                # Initialize input variables
-                search_input = ""
-
-                # Define instructions
-                instructions = ["Press Enter to search", "Press Ctrl+C to quit"]
-
-                # Draw prompt above the input field
-                stdscr.addstr(content_start, prompt_x, prompt)
-
-                while True:
-                    # Redraw the input field with a line of spacing
-                    stdscr.addstr(
-                        content_start + 2,
-                        input_x,
-                        " " * input_width,
-                        curses.A_UNDERLINE,
-                    )
-
-                    # Center the text within the input field
-                    if search_input:
-                        text_start = input_x + (input_width - len(search_input)) // 2
-                        stdscr.addstr(content_start + 2, text_start, search_input)
-                        cursor_x = text_start + len(search_input)
-                    else:
-                        cursor_x = input_x + (input_width // 2)
-
-                    # Draw instructions centered
-                    for i, instruction in enumerate(instructions):
-                        instr_x = (width - len(instruction)) // 2
-                        stdscr.addstr(content_start + 4 + i, instr_x, instruction)
-
-                    # Move cursor to correct position
-                    stdscr.move(content_start + 2, cursor_x)
-                    stdscr.refresh()
-
-                    # Get input
-                    try:
-                        ch = stdscr.getch()
-                    except KeyboardInterrupt:
-                        return
-
-                    if ch in (curses.KEY_ENTER, 10, 13):  # Enter key
-                        if search_input:
-                            break
-                    elif ch in (curses.KEY_BACKSPACE, 127, 8):  # Backspace
-                        if search_input:
-                            search_input = search_input[:-1]
-                    elif ch == curses.KEY_RESIZE:
-                        height, width = stdscr.getmaxyx()
-                        stdscr.clear()
-                    elif 32 <= ch <= 126:  # Printable characters
-                        if len(search_input) < input_width - 2:  # Leave some padding
-                            search_input += chr(ch)
-
-                curses.noecho()
-                curses.curs_set(0)
-
-                if search_input:
-                    self.run_brew_search(search_input)
-                    break
+            search_input = self._search_input_flow(stdscr)
+            if search_input:
+                self.run_brew_search(search_input)
         else:
             self.run_brew_search(search_term)
 
         # Continue with the rest of the UI loop
         while True:
+            # If a new search was requested from input handling, open the prompt
+            if self.request_search_input:
+                self.request_search_input = False
+                search_input = self._search_input_flow(stdscr)
+                if search_input:
+                    self.run_brew_search(search_input)
             self.draw_screen(stdscr)
             if not self.handle_input(stdscr):
                 break
 
+    def _search_input_flow(self, stdscr) -> Optional[str]:
+        """Render search prompt and collect input; return the term or None."""
+        height, width = stdscr.getmaxyx()
+        title = "Brewse: Homebrew Search"
+        input_width = 30  # Define fixed input width
+
+        # Set timeout for non-blocking input to allow progress updates
+        stdscr.timeout(100)  # 100ms timeout
+        curses.curs_set(1)  # Show cursor
+
+        while True:
+            stdscr.clear()
+
+            # Draw fancy border
+            self.draw_header(stdscr, title, width)
+
+            # Center the content vertically
+            content_start = (height - 6) // 2
+
+            # Draw prompt with a box around it
+            prompt = "Search anywhere in name:"
+            prompt_x = (width - len(prompt)) // 2  # Center the prompt
+            input_x = (width - input_width) // 2  # Center the input field
+
+            # Initialize input variables
+            search_input = ""
+            search_submitted = False
+            user_modified_after_submit = False
+
+            # Define instructions
+            instructions = ["Press Enter to search", "Press Ctrl+C to quit"]
+
+            # Draw prompt above the input field
+            stdscr.addstr(content_start, prompt_x, prompt)
+
+            while True:
+                stdscr.clear()
+
+                # Redraw header
+                self.draw_header(stdscr, title, width)
+                stdscr.addstr(content_start, prompt_x, prompt)
+
+                # Determine if we should gray out the input (search submitted but not modified)
+                input_style = curses.A_UNDERLINE
+                text_style = curses.A_NORMAL
+                if search_submitted and not user_modified_after_submit:
+                    text_style = curses.A_DIM
+
+                # Redraw the input field with a line of spacing
+                stdscr.addstr(
+                    content_start + 2,
+                    input_x,
+                    " " * input_width,
+                    input_style,
+                )
+
+                # Center the text within the input field
+                if search_input:
+                    text_start = input_x + (input_width - len(search_input)) // 2
+                    stdscr.addstr(
+                        content_start + 2, text_start, search_input, text_style
+                    )
+                    cursor_x = text_start + len(search_input)
+                else:
+                    cursor_x = input_x + (input_width // 2)
+
+                # Draw instructions centered (unless search is submitted)
+                if not search_submitted:
+                    for i, instruction in enumerate(instructions):
+                        instr_x = (width - len(instruction)) // 2
+                        stdscr.addstr(content_start + 4 + i, instr_x, instruction)
+                else:
+                    # Show "search queued" message
+                    if user_modified_after_submit:
+                        queued_msg = "Press Enter again to update search"
+                        queued_x = (width - len(queued_msg)) // 2
+                        stdscr.addstr(
+                            content_start + 4, queued_x, queued_msg, curses.A_DIM
+                        )
+                    else:
+                        queued_msg = (
+                            f"Search queued: '{search_input}' - waiting for data..."
+                        )
+                        queued_x = (width - len(queued_msg)) // 2
+                        stdscr.addstr(
+                            content_start + 4, queued_x, queued_msg, curses.A_DIM
+                        )
+
+                # Show loading progress if downloading
+                if self.is_loading and not self.is_data_loaded:
+                    with self.progress_lock:
+                        current = self.download_progress["current"]
+                        total = self.download_progress["total"]
+
+                    # Use bold style if search is submitted, dim if just loading
+                    progress_style = curses.A_BOLD if search_submitted else curses.A_DIM
+
+                    if total > 0:
+                        # Show progress bar
+                        percent = (current / total) * 100
+                        current_mb = current / (1024 * 1024)
+                        total_mb = total / (1024 * 1024)
+
+                        progress_text = f"Downloading package data: {current_mb:.1f} / {total_mb:.1f} MB ({percent:.0f}%)"
+                        progress_x = (width - len(progress_text)) // 2
+
+                        # Position below instructions with extra spacing
+                        progress_y = content_start + 7
+                        if progress_y < height - 2:
+                            try:
+                                stdscr.addstr(
+                                    progress_y,
+                                    progress_x,
+                                    progress_text,
+                                    progress_style,
+                                )
+
+                                # Draw progress bar
+                                bar_width = min(50, width - 10)
+                                bar_x = (width - bar_width) // 2
+                                filled = int(bar_width * (current / total))
+                                bar = "█" * filled + "░" * (bar_width - filled)
+                                stdscr.addstr(
+                                    progress_y + 1, bar_x, bar, progress_style
+                                )
+                            except curses.error:
+                                pass
+                    else:
+                        # Just show loading message
+                        loading_text = "Preparing download..."
+                        loading_x = (width - len(loading_text)) // 2
+                        progress_y = content_start + 7
+                        if progress_y < height - 2:
+                            try:
+                                stdscr.addstr(
+                                    progress_y, loading_x, loading_text, progress_style
+                                )
+                            except curses.error:
+                                pass
+                elif self.is_data_loaded:
+                    # If search was submitted and data is now loaded, execute the search
+                    if search_submitted and not user_modified_after_submit:
+                        stdscr.timeout(-1)  # Reset to blocking
+                        curses.curs_set(0)
+                        return search_input
+
+                    # Show ready message
+                    ready_text = "✓ Ready to search"
+                    ready_x = (width - len(ready_text)) // 2
+                    progress_y = content_start + 7
+                    if progress_y < height - 2:
+                        try:
+                            stdscr.addstr(progress_y, ready_x, ready_text, curses.A_DIM)
+                        except curses.error:
+                            pass
+
+                # Move cursor to correct position
+                stdscr.move(content_start + 2, cursor_x)
+                stdscr.refresh()
+
+                # Get input (non-blocking with timeout)
+                try:
+                    ch = stdscr.getch()
+                except KeyboardInterrupt:
+                    stdscr.timeout(-1)  # Reset to blocking
+                    curses.curs_set(0)
+                    return None
+
+                # If no input (timeout), continue loop to update progress
+                if ch == -1:
+                    continue
+
+                # Handle Ctrl+C to quit
+                if ch == 3:  # Ctrl+C
+                    stdscr.timeout(-1)  # Reset to blocking
+                    curses.curs_set(0)
+                    return None
+
+                if ch in (curses.KEY_ENTER, 10, 13):  # Enter key
+                    if search_input:
+                        # Check if data is already loaded
+                        if self.is_data_loaded:
+                            stdscr.timeout(-1)  # Reset to blocking
+                            curses.noecho()
+                            curses.curs_set(0)
+                            return search_input
+                        else:
+                            # Mark as submitted but allow editing
+                            search_submitted = True
+                            user_modified_after_submit = False
+                elif ch in (curses.KEY_BACKSPACE, 127, 8):  # Backspace
+                    if search_input:
+                        search_input = search_input[:-1]
+                        if search_submitted:
+                            user_modified_after_submit = True
+                elif ch == curses.KEY_RESIZE:
+                    height, width = stdscr.getmaxyx()
+                    stdscr.clear()
+                elif 32 <= ch <= 126:  # Printable characters
+                    if len(search_input) < input_width - 2:  # Leave some padding
+                        search_input += chr(ch)
+                        if search_submitted:
+                            user_modified_after_submit = True
+
 
 def main():
     """Entry point for the CLI."""
-    app = BrewInteractive()
-    if len(sys.argv) < 2:
-        curses.wrapper(lambda stdscr: app.main(stdscr, None))
+    # Import version, with fallback for direct script execution
+    try:
+        from brewse import __version__
+    except ImportError:
+        __version__ = "0.1.2"  # Fallback for development
+
+    parser = argparse.ArgumentParser(
+        description="An interactive TUI browser for Homebrew packages", prog="brewse"
+    )
+    parser.add_argument(
+        "search_term", nargs="?", help="Optional search term to use immediately"
+    )
+    parser.add_argument("--version", action="version", version=f"brewse {__version__}")
+    parser.add_argument(
+        "--refresh", action="store_true", help="Force refresh of cached package data"
+    )
+    parser.add_argument(
+        "--clear-cache", action="store_true", help="Clear all cached data and exit"
+    )
+
+    args = parser.parse_args()
+
+    # Handle --clear-cache
+    if args.clear_cache:
+        cache_dir = Path.home() / ".cache" / "brewse"
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+            print(f"✓ Cache cleared: {cache_dir}")
+        else:
+            print(f"Cache directory does not exist: {cache_dir}")
+        return
+
+    # Create app with force_refresh flag
+    app = BrewInteractive(force_refresh=args.refresh)
+
+    # Run with or without search term
+    if args.search_term:
+        curses.wrapper(lambda stdscr: app.main(stdscr, args.search_term))
     else:
-        search_term = sys.argv[1]
-        curses.wrapper(lambda stdscr: app.main(stdscr, search_term))
+        curses.wrapper(lambda stdscr: app.main(stdscr, None))
 
 
 if __name__ == "__main__":
