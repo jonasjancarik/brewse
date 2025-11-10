@@ -2,23 +2,9 @@
 
 An interactive TUI (Terminal User Interface) browser for Homebrew packages. Brewse provides a fast, user-friendly way to search, view, and install or uninstall Homebrew packages.
 
-## Features
-
-- Interactive search interface for both Formulae and Casks
-- Detailed package information including:
-  - Version
-  - Description
-  - Homepage
-  - Installation status
-  - Installation analytics (30/90/365 days)
-- Quick installation/uninstallation of packages
-- Keyboard-driven navigation
-- Local caching of package data for faster subsequent searches
-- Real-time download progress indicator with visual progress bar
-
 ## Installation
 
-### Option 1: Using Homebrew (recommended)
+### Using Homebrew (recommended)
 
 ```bash
 brew tap jonasjancarik/brewse
@@ -29,32 +15,6 @@ Or install directly from the tap URL:
 
 ```bash
 brew install jonasjancarik/brewse/brewse
-```
-
-### Option 2: Using uvx (run without installing)
-
-Try brewse instantly without installation:
-
-```bash
-uvx brewse
-```
-
-**Note:** Requires [uv](https://docs.astral.sh/uv/) to be installed. You can install it with:
-
-```bash
-brew install uv
-```
-
-### Option 3: Using pip
-
-```bash
-pip install brewse
-```
-
-### Option 4: Using pipx (isolated environment)
-
-```bash
-pipx install brewse
 ```
 
 ## Usage
@@ -80,15 +40,37 @@ brewse --refresh         # Force refresh of cached package data
 brewse --clear-cache     # Clear all cached data and exit
 ```
 
-## Requirements
-
-- Python 3.7+
-- Homebrew
-- Internet connection
-
 ## Cache
 
 Brewse caches package data in `~/.cache/brewse/` to improve performance. Cache entries expire after 24 hours.
+
+## Alternative Installation Methods
+
+### Using pip
+
+```bash
+pip install brewse
+```
+
+### Using pipx or uvx
+
+Run in an isolated environment with pipx:
+
+```bash
+pipx install brewse
+```
+
+Or run instantly without installation using uvx:
+
+```bash
+uvx brewse
+```
+
+**Note:** uvx requires [uv](https://docs.astral.sh/uv/) to be installed first:
+
+```bash
+brew install uv
+```
 
 ## Development & Releases
 
