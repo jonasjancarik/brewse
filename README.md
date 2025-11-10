@@ -7,13 +7,6 @@ An interactive TUI (Terminal User Interface) browser for Homebrew packages. Brew
 ### Using Homebrew (recommended)
 
 ```bash
-brew tap jonasjancarik/brewse
-brew install brewse
-```
-
-Or install directly from the tap URL:
-
-```bash
 brew install jonasjancarik/brewse/brewse
 ```
 
@@ -95,7 +88,7 @@ The GitHub Action will automatically:
 - Update the Homebrew tap formula
 - Push changes to the `homebrew-brewse` repository
 
-See [.github/AUTOMATION_SETUP.md](.github/AUTOMATION_SETUP.md) for setup details.
+See [.github/AUTOMATION_SETUP.md](.github/AUTOMATION_SETUP.md) for setup details. (Useful if you want to fork this repo, obviously you will need to change the GitHub username.)
 
 ### Manual Tap Update
 

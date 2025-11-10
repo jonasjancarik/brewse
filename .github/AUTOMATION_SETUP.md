@@ -14,7 +14,7 @@ The action needs permission to push to the `homebrew-brewse` repository.
    - **Token name**: `brewse-tap-updater`
    - **Expiration**: 1 year (or custom)
    - **Repository access**: Select "Only select repositories"
-     - Choose: `jonasjancarik/homebrew-brewse`
+     - Choose: `your-username/homebrew-brewse`
    - **Permissions** → Repository permissions:
      - Contents: **Read and write**
 4. Click "Generate token"
@@ -22,7 +22,7 @@ The action needs permission to push to the `homebrew-brewse` repository.
 
 ### 2. Add the token to your repository secrets
 
-1. Go to https://github.com/jonasjancarik/brewse/settings/secrets/actions
+1. Go to https://github.com/your-username/brewse/settings/secrets/actions
 2. Click "New repository secret"
 3. Configure:
    - **Name**: `TAP_UPDATE_TOKEN`
