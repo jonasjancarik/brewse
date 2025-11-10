@@ -69,14 +69,28 @@ brewse --version
 
 ## 4. Update the formula for new releases
 
-When you release a new version:
+When you release a new version, use the automated update script:
 
 ```bash
 cd homebrew-brewse
 
-# Update Formula/brewse.rb with:
-# - New version number in the url
-# - New SHA256 hash
+# Run the update script with the new version number
+./update-formula.sh 0.1.3
+```
+
+The script will automatically:
+- Download the tarball from PyPI
+- Calculate the SHA256 hash
+- Update Formula/brewse.rb
+- Show you the diff
+- Commit and push (with confirmation)
+
+### Manual update (if needed)
+
+If you prefer to update manually:
+
+```bash
+cd homebrew-brewse
 
 # Get the new SHA256:
 curl -sL https://files.pythonhosted.org/packages/source/b/brewse/brewse-X.Y.Z.tar.gz | shasum -a 256
