@@ -1517,7 +1517,7 @@ def main():
     try:
         from brewse import __version__
     except ImportError:
-        __version__ = "0.1.2"  # Fallback for development
+        __version__ = "0.2.0"  # Fallback for development
 
     parser = argparse.ArgumentParser(
         description="An interactive TUI browser for Homebrew packages", prog="brewse"
