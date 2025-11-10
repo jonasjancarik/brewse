@@ -2,6 +2,20 @@
 
 An interactive TUI (Terminal User Interface) browser for Homebrew packages. Brewse provides a fast, user-friendly way to search, view, and install or uninstall Homebrew packages.
 
+## Quick Start
+
+Try it instantly without installing:
+
+```bash
+uvx brewse
+```
+
+Or search directly:
+
+```bash
+uvx brewse python
+```
+
 ## Features
 
 - Interactive search interface for both Formulae and Casks
@@ -18,10 +32,35 @@ An interactive TUI (Terminal User Interface) browser for Homebrew packages. Brew
 
 ## Installation
 
-Install via pip:
+### Option 1: Using pip (recommended for permanent installation)
 
-```
+```bash
 pip install brewse
+```
+
+### Option 2: Using pipx (isolated environment)
+
+```bash
+pipx install brewse
+```
+
+### Option 3: Using uvx (run without installing)
+
+```bash
+uvx brewse
+```
+
+### Option 4: Using Homebrew (custom tap)
+
+```bash
+brew tap jonasjancarik/brewse
+brew install brewse
+```
+
+Or install directly from the tap URL:
+
+```bash
+brew install jonasjancarik/brewse/brewse
 ```
 
 ## Usage
