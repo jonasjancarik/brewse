@@ -7,6 +7,8 @@ from typing import List, Dict, Optional
 import urllib.request
 import json
 from pathlib import Path
+import os
+import shlex
 from datetime import datetime, timedelta
 import threading
 import time
@@ -49,6 +51,7 @@ class BrewInteractive:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.is_data_loaded = False
         self.is_loading = False
+        self.load_error = None
         self.request_search_input = False  # Signal to re-open search prompt
         # Progress tracking
         self.download_progress = {"current": 0, "total": 0, "file": ""}
@@ -67,6 +70,12 @@ class BrewInteractive:
         self._system_binary_cache = {}
         # Track install/uninstall operations in progress
         self.operation_in_progress = None  # None, "installing", or "uninstalling"
+        # Store last brew command output for review
+        self.last_command_title = None
+        self.last_command_status = None
+        self.last_command_output = None
+        self.output_scroll_offset = 0
+        self.previous_view_mode = None
 
     def _get_cache_path(self, url: str) -> Path:
         """Generate a cache file path from URL."""
@@ -93,11 +102,17 @@ class BrewInteractive:
         # Check if cache exists and is fresh (less than 24 hours old)
         # Skip cache if force_refresh is enabled
         if not self.force_refresh and cache_path.exists():
-            with open(cache_path) as f:
-                cached_data = json.load(f)
+            try:
+                with open(cache_path) as f:
+                    cached_data = json.load(f)
                 cached_time = datetime.fromtimestamp(cached_data["timestamp"])
                 if datetime.now() - cached_time < timedelta(hours=24):
                     return cached_data["data"]
+            except Exception:
+                try:
+                    cache_path.unlink()
+                except Exception:
+                    pass
 
         # Only show loading message when actually fetching from network
         if hasattr(self, "stdscr") and self.search_term:
@@ -138,9 +153,19 @@ class BrewInteractive:
                                 self.download_progress["current"] += len(chunk)
                                 self.download_progress["file"] = filename
 
-                    data = json.loads(data_bytes)
+                    try:
+                        data = json.loads(data_bytes)
+                    except json.JSONDecodeError:
+                        raise Exception(
+                            "Invalid JSON response. Retry the download or clear cache."
+                        )
                 else:
-                    data = json.loads(response.read())
+                    try:
+                        data = json.loads(response.read())
+                    except json.JSONDecodeError:
+                        raise Exception(
+                            "Invalid JSON response. Retry the download or clear cache."
+                        )
         except urllib.error.URLError as e:
             raise Exception(
                 f"Network error: {e.reason}. Check your internet connection."
@@ -159,6 +184,7 @@ class BrewInteractive:
         """Load initial API data in background."""
         try:
             self.is_loading = True
+            self.load_error = None
 
             # Get file sizes first
             formula_url = f"{self.api_base_url}/formula.json"
@@ -186,6 +212,9 @@ class BrewInteractive:
             )
             self.casks_data = self._fetch_json(cask_url, track_progress=not cask_cached)
             self.is_data_loaded = True
+        except Exception as e:
+            self.load_error = str(e)
+            self.is_data_loaded = False
         finally:
             self.is_loading = False
 
@@ -754,6 +783,133 @@ class BrewInteractive:
                 pass
             return False
 
+    def _get_cask_appdir(self) -> Path:
+        """Resolve the cask app directory based on environment configuration."""
+        opts = os.environ.get("HOMEBREW_CASK_OPTS", "")
+        appdir = None
+        tokens = shlex.split(opts)
+        for index, token in enumerate(tokens):
+            if token == "--appdir" and index + 1 < len(tokens):
+                appdir = tokens[index + 1]
+                break
+            if token.startswith("--appdir="):
+                appdir = token.split("=", 1)[1]
+                break
+
+        if appdir:
+            return Path(appdir).expanduser()
+        return Path("/Applications")
+
+    def _get_cask_data(self, package_name: str) -> Optional[dict]:
+        """Return cached cask data if available."""
+        if not self.casks_data:
+            return None
+        for cask in self.casks_data:
+            if cask.get("token") == package_name:
+                return cask
+        return None
+
+    def _artifacts_may_need_sudo(self, artifacts: Optional[list]) -> bool:
+        """Best-effort check for artifacts that often require sudo."""
+        if not artifacts:
+            return False
+        for artifact in artifacts:
+            if isinstance(artifact, dict):
+                for key in artifact.keys():
+                    key_name = str(key).lower()
+                    if key_name in ("pkg", "installer", "pkgutil", "uninstall", "font"):
+                        return True
+            elif isinstance(artifact, list):
+                if artifact and isinstance(artifact[0], str):
+                    kind = artifact[0].lower()
+                    if kind in ("pkg", "installer", "pkgutil", "uninstall", "font"):
+                        return True
+        return False
+
+    def _maybe_requires_sudo(self, package: BrewPackage) -> Optional[str]:
+        """Return a reason string if a package may require sudo."""
+        if package.category != "Casks":
+            return None
+
+        reasons = []
+        app_dir = self._get_cask_appdir()
+        if app_dir.exists():
+            if not os.access(app_dir, os.W_OK):
+                reasons.append(f"{app_dir} is not writable")
+        else:
+            parent = app_dir.parent
+            if parent.exists() and not os.access(parent, os.W_OK):
+                reasons.append(f"{parent} is not writable")
+
+        cask_data = self._get_cask_data(package.name)
+        artifacts = cask_data.get("artifacts") if cask_data else None
+        if self._artifacts_may_need_sudo(artifacts):
+            reasons.append("cask uses installer/pkg artifacts")
+
+        if reasons:
+            return "; ".join(reasons)
+        return None
+
+    def _record_command_output(
+        self,
+        title: str,
+        status: str,
+        output: str,
+        output_in_terminal: bool = False,
+    ) -> None:
+        """Capture brew command output for later viewing."""
+        self.last_command_title = title
+        self.last_command_status = status
+
+        if output_in_terminal:
+            lines = ["Output was shown in the terminal."]
+        else:
+            cleaned = (output or "").strip("\n")
+            lines = cleaned.splitlines() if cleaned else ["(no output)"]
+
+        self.last_command_output = lines
+        self.output_scroll_offset = 0
+
+    def _prompt_confirm(self, lines: List[str]) -> bool:
+        """Prompt the user with a yes/no question."""
+        self.draw_screen(self.stdscr)
+        height, width = self.stdscr.getmaxyx()
+        start_line = max(0, height - len(lines) - 2)
+        for index, line in enumerate(lines):
+            try:
+                self.stdscr.addstr(
+                    start_line + index,
+                    0,
+                    line[: width - 1].ljust(width - 1),
+                    curses.A_BOLD,
+                )
+            except curses.error:
+                pass
+        self.stdscr.refresh()
+
+        while True:
+            ch = self.stdscr.getch()
+            if ch in (ord("y"), ord("Y")):
+                return True
+            if ch in (ord("n"), ord("N"), 27):
+                return False
+
+    def _run_command_interactive(self, args: List[str]) -> subprocess.CompletedProcess:
+        """Run a command with terminal output, allowing sudo prompts."""
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            result = subprocess.run(args)
+            try:
+                input("Press Enter to return to Brewse...")
+            except EOFError:
+                pass
+        finally:
+            curses.reset_prog_mode()
+            curses.curs_set(0)
+            self.stdscr.refresh()
+        return result
+
     def draw_screen(self, stdscr) -> None:
         """Draw the current screen based on view mode."""
         stdscr.clear()
@@ -765,6 +921,8 @@ class BrewInteractive:
             self.draw_package_info(stdscr, height, width)
         elif self.view_mode == "help":
             self.draw_help(stdscr, height, width)
+        elif self.view_mode == "output":
+            self.draw_output(stdscr, height, width)
 
         stdscr.refresh()
 
@@ -872,6 +1030,8 @@ class BrewInteractive:
             footer = "↑/↓: Navigate | Enter: Show Info | q: Quit | i: Install | /: Search | h: Help"
         else:
             footer = "↑/↓: Navigate | Enter: Show Info | q: Quit | i: Install | n: New Search | t: Top Packages | h: Help"
+        if self.last_command_output:
+            footer += " | o: Output"
         try:
             stdscr.addstr(height - 1, 0, footer[: width - 1], curses.A_BOLD)
         except curses.error:
@@ -927,6 +1087,8 @@ class BrewInteractive:
             footer = "←: Back | h: Help | q: Quit (Operation in progress...)"
         else:
             footer = "←: Back | i: Install | u: Uninstall | h: Help | q: Quit"
+        if self.last_command_output:
+            footer += " | o: Output"
         try:
             stdscr.addstr(height - 1, 0, footer[: width - 1], curses.A_BOLD)
         except curses.error:
@@ -942,6 +1104,7 @@ class BrewInteractive:
             "General:",
             "  q         Quit",
             "  h or ?    Help",
+            "  o         Show last command output",
             "  / or n    New search",
             "  ← or ⌫    Back",
             "",
@@ -957,6 +1120,11 @@ class BrewInteractive:
             "  ←         Back to results",
             "  i         Install",
             "  u         Uninstall",
+            "",
+            "Output view:",
+            "  ↑/↓       Scroll",
+            "  PgUp/PgDn Page up/down",
+            "  ←         Back",
             "",
             f"Cache: {self.cache_dir}",
         ]
@@ -976,6 +1144,43 @@ class BrewInteractive:
         except curses.error:
             pass
 
+    def draw_output(self, stdscr, height: int, width: int) -> None:
+        """Draw the command output screen."""
+        current_line = self.draw_header(stdscr, "Command Output", width)
+
+        if not self.last_command_output:
+            try:
+                stdscr.addstr(current_line, 2, "No command output available.")
+            except curses.error:
+                pass
+        else:
+            title = self.last_command_title or "(unknown)"
+            status = self.last_command_status or "(unknown)"
+            header_lines = [f"Command: {title}", f"Status: {status}", ""]
+            lines = header_lines + self.last_command_output
+
+            available_lines = max(0, height - current_line - 1)
+            max_scroll = max(0, len(lines) - available_lines)
+            self.output_scroll_offset = min(self.output_scroll_offset, max_scroll)
+
+            visible = lines[
+                self.output_scroll_offset : self.output_scroll_offset + available_lines
+            ]
+            for line in visible:
+                if current_line >= height - 1:
+                    break
+                try:
+                    stdscr.addstr(current_line, 2, line[: max(0, width - 4)])
+                except curses.error:
+                    pass
+                current_line += 1
+
+        footer = "Up/Down: Scroll | PgUp/PgDn: Page | Left: Back | q: Quit"
+        try:
+            stdscr.addstr(height - 1, 0, footer[: width - 1], curses.A_BOLD)
+        except curses.error:
+            pass
+
     def install_package(self) -> None:
         """Install the currently selected package."""
         # Block if another operation is in progress
@@ -989,25 +1194,79 @@ class BrewInteractive:
                 p for p in self.packages if p.name == self.current_package_info.name
             )
 
+        run_interactive = False
+        sudo_reason = self._maybe_requires_sudo(package)
+        if sudo_reason:
+            confirm_lines = [
+                "Install may require sudo.",
+                f"Reason: {sudo_reason}",
+                "Run in terminal now? (y/n)",
+            ]
+            if not self._prompt_confirm(confirm_lines):
+                message = f"Install cancelled for {package.name}"
+                self._record_command_output(
+                    f"brew install {package.name}", message, ""
+                )
+                self.draw_screen(self.stdscr)
+                try:
+                    height, width = self.stdscr.getmaxyx()
+                    self.stdscr.addstr(
+                        height - 2,
+                        0,
+                        (message[: width - 1]).ljust(width - 1),
+                        curses.A_BOLD,
+                    )
+                    self.stdscr.refresh()
+                except Exception:
+                    pass
+                return
+            run_interactive = True
+
         # Set operation flag and refresh screen
         self.operation_in_progress = "installing"
         self.draw_screen(self.stdscr)
         self.stdscr.refresh()
 
-        # Temporarily leave curses input echo for command execution output capture
         try:
-            result = subprocess.run(
-                ["brew", "install", package.name], capture_output=True, text=True
-            )
-            success = result.returncode == 0
-            message = (
-                f"Installed {package.name}"
-                if success
-                else f"Install failed: {result.stderr.strip()}"
-            )
+            if run_interactive:
+                result = self._run_command_interactive(["brew", "install", package.name])
+                success = result.returncode == 0
+                message = (
+                    f"Installed {package.name}"
+                    if success
+                    else f"Install finished with errors for {package.name}"
+                )
+                self._record_command_output(
+                    f"brew install {package.name}",
+                    message,
+                    "",
+                    output_in_terminal=True,
+                )
+            else:
+                result = subprocess.run(
+                    ["brew", "install", package.name], capture_output=True, text=True
+                )
+                success = result.returncode == 0
+                error_output = (result.stderr or result.stdout or "").strip()
+                if error_output:
+                    error_line = error_output.splitlines()[-1]
+                    if len(error_line) > 120:
+                        error_line = f"{error_line[:117]}..."
+                else:
+                    error_line = ""
+                message = (
+                    f"Installed {package.name}"
+                    if success
+                    else f"Install failed: {error_line or 'see output'}"
+                )
+                combined_output = (result.stdout or "") + (result.stderr or "")
+                self._record_command_output(
+                    f"brew install {package.name}", message, combined_output
+                )
         except Exception as e:
             success = False
             message = f"Install error: {e}"
+            self._record_command_output(f"brew install {package.name}", message, str(e))
         finally:
             # Clear operation flag
             self.operation_in_progress = None
@@ -1057,24 +1316,83 @@ class BrewInteractive:
                 p for p in self.packages if p.name == self.current_package_info.name
             )
 
+        run_interactive = False
+        sudo_reason = self._maybe_requires_sudo(package)
+        if sudo_reason:
+            confirm_lines = [
+                "Uninstall may require sudo.",
+                f"Reason: {sudo_reason}",
+                "Run in terminal now? (y/n)",
+            ]
+            if not self._prompt_confirm(confirm_lines):
+                message = f"Uninstall cancelled for {package.name}"
+                self._record_command_output(
+                    f"brew uninstall {package.name}", message, ""
+                )
+                self.draw_screen(self.stdscr)
+                try:
+                    height, width = self.stdscr.getmaxyx()
+                    self.stdscr.addstr(
+                        height - 2,
+                        0,
+                        (message[: width - 1]).ljust(width - 1),
+                        curses.A_BOLD,
+                    )
+                    self.stdscr.refresh()
+                except Exception:
+                    pass
+                return
+            run_interactive = True
+
         # Set operation flag and refresh screen
         self.operation_in_progress = "uninstalling"
         self.draw_screen(self.stdscr)
         self.stdscr.refresh()
 
         try:
-            result = subprocess.run(
-                ["brew", "uninstall", package.name], capture_output=True, text=True
-            )
-            success = result.returncode == 0
-            message = (
-                f"Uninstalled {package.name}"
-                if success
-                else f"Uninstall failed: {result.stderr.strip()}"
-            )
+            if run_interactive:
+                result = self._run_command_interactive(
+                    ["brew", "uninstall", package.name]
+                )
+                success = result.returncode == 0
+                message = (
+                    f"Uninstalled {package.name}"
+                    if success
+                    else f"Uninstall finished with errors for {package.name}"
+                )
+                self._record_command_output(
+                    f"brew uninstall {package.name}",
+                    message,
+                    "",
+                    output_in_terminal=True,
+                )
+            else:
+                result = subprocess.run(
+                    ["brew", "uninstall", package.name], capture_output=True, text=True
+                )
+                success = result.returncode == 0
+                error_output = (result.stderr or result.stdout or "").strip()
+                if error_output:
+                    error_line = error_output.splitlines()[-1]
+                    if len(error_line) > 120:
+                        error_line = f"{error_line[:117]}..."
+                else:
+                    error_line = ""
+                message = (
+                    f"Uninstalled {package.name}"
+                    if success
+                    else f"Uninstall failed: {error_line or 'see output'}"
+                )
+                combined_output = (result.stdout or "") + (result.stderr or "")
+                self._record_command_output(
+                    f"brew uninstall {package.name}", message, combined_output
+                )
         except Exception as e:
             success = False
             message = f"Uninstall error: {e}"
+            self._record_command_output(
+                f"brew uninstall {package.name}", message, str(e)
+            )
         finally:
             # Clear operation flag
             self.operation_in_progress = None
@@ -1151,6 +1469,12 @@ class BrewInteractive:
         elif key == ord("h"):  # Show help
             self.view_mode = "help"
             return True
+        elif key == ord("o") and self.last_command_output:  # Show last output
+            if self.view_mode != "output":
+                self.previous_view_mode = self.view_mode
+                self.view_mode = "output"
+                self.output_scroll_offset = 0
+            return True
         elif key == ord(" "):  # Page down
             self.selected_index = min(
                 len(self.packages) - 1, self.selected_index + (height - 5)
@@ -1192,6 +1516,22 @@ class BrewInteractive:
             ):
                 # ESC (27), Left, or Backspace exits help
                 self.view_mode = "search"
+        elif self.view_mode == "output":
+            if key in (curses.KEY_LEFT, 27) or key in (
+                ord("\b"),
+                curses.KEY_BACKSPACE,
+                127,
+                8,
+            ):
+                self.view_mode = self.previous_view_mode or "search"
+            elif key == curses.KEY_UP:
+                self.output_scroll_offset = max(0, self.output_scroll_offset - 1)
+            elif key == curses.KEY_DOWN:
+                self.output_scroll_offset += 1
+            elif key == curses.KEY_PPAGE:
+                self.output_scroll_offset = max(0, self.output_scroll_offset - (height - 5))
+            elif key == curses.KEY_NPAGE:
+                self.output_scroll_offset += height - 5
 
         return True
 
@@ -1289,38 +1629,47 @@ class BrewInteractive:
             self.draw_header(stdscr, title, width)
 
             # Center the content vertically
-            content_start = (height - 8) // 2
+            content_start = max(4, (height - 12) // 2)
 
-            # Draw mode selection options
-            mode_options = [
-                ("Search packages", "Search anywhere in name"),
-                ("Top packages", "Show most popular packages not installed"),
+            # Draw mode selector
+            mode_titles = ["Search", "Top packages"]
+            mode_descriptions = [
+                "Search anywhere in name",
+                "Show most popular packages not installed",
             ]
-
-            # Draw mode selection
+            mode_label = "Mode: "
+            mode_segments = [f" {title} " for title in mode_titles]
+            gap = 2
+            total_width = (
+                len(mode_label)
+                + sum(len(segment) for segment in mode_segments)
+                + gap * (len(mode_segments) - 1)
+            )
+            mode_x = max(0, (width - total_width) // 2)
             mode_y = content_start
-            for idx, (mode_title, mode_desc) in enumerate(mode_options):
-                mode_x = (width - len(mode_title)) // 2
-                if idx == selected_mode:
-                    # Selected mode - highlight it
-                    stdscr.addstr(
-                        mode_y, mode_x, mode_title, curses.A_REVERSE | curses.A_BOLD
-                    )
-                    # Show description below
-                    desc_x = (width - len(mode_desc)) // 2
-                    stdscr.addstr(mode_y + 1, desc_x, mode_desc, curses.A_DIM)
-                else:
-                    stdscr.addstr(mode_y, mode_x, mode_title, curses.A_DIM)
-                mode_y += 3
+            stdscr.addstr(mode_y, mode_x, mode_label)
+
+            segment_x = mode_x + len(mode_label)
+            for idx, segment in enumerate(mode_segments):
+                attr = curses.A_REVERSE | curses.A_BOLD if idx == selected_mode else curses.A_DIM
+                stdscr.addstr(mode_y, segment_x, segment, attr)
+                segment_x += len(segment) + gap
+
+            desc_text = mode_descriptions[selected_mode]
+            desc_y = mode_y + 2
+            desc_x = (width - len(desc_text)) // 2
+            stdscr.addstr(desc_y, desc_x, desc_text, curses.A_DIM)
+
+            input_block_y = desc_y + 2
 
             # If Search mode is selected, show input field
             if selected_mode == 0:
-                prompt = "Search anywhere in name:"
+                prompt = "Search term:"
                 prompt_x = (width - len(prompt)) // 2
                 input_x = (width - input_width) // 2
 
                 # Draw prompt above the input field
-                stdscr.addstr(mode_y, prompt_x, prompt)
+                stdscr.addstr(input_block_y, prompt_x, prompt)
 
                 # Draw the input field
                 input_style = curses.A_UNDERLINE
@@ -1329,7 +1678,7 @@ class BrewInteractive:
                     text_style = curses.A_DIM
 
                 stdscr.addstr(
-                    mode_y + 2,
+                    input_block_y + 1,
                     input_x,
                     " " * input_width,
                     input_style,
@@ -1338,31 +1687,35 @@ class BrewInteractive:
                 # Center the text within the input field
                 if search_input:
                     text_start = input_x + (input_width - len(search_input)) // 2
-                    stdscr.addstr(mode_y + 2, text_start, search_input, text_style)
+                    stdscr.addstr(
+                        input_block_y + 1, text_start, search_input, text_style
+                    )
                     cursor_x = text_start + len(search_input)
                 else:
                     cursor_x = input_x + (input_width // 2)
+                input_y = input_block_y + 1
             else:
                 # Top Packages mode - no input field
+                action_text = "Press Enter to show top packages"
+                action_x = (width - len(action_text)) // 2
+                stdscr.addstr(input_block_y, action_x, action_text, curses.A_DIM)
                 cursor_x = 0
+                input_y = input_block_y
 
             # Draw instructions
             if selected_mode == 0:
                 if search_submitted and not user_modified_after_submit:
-                    if user_modified_after_submit:
-                        instructions = ["Press Enter again to update search"]
-                    else:
-                        instructions = [
-                            f"Search queued: '{search_input}' - waiting for data..."
-                        ]
+                    instructions = [
+                        f"Search queued: '{search_input}' - waiting for data..."
+                    ]
                 else:
-                    instructions = ["↑/↓: Switch mode | Enter: Search | Ctrl+C: Quit"]
+                    instructions = ["Up/Down: Switch mode | Enter: Search | Ctrl+C: Quit"]
             else:
                 instructions = [
-                    "↑/↓: Switch mode | Enter: Show top packages | Ctrl+C: Quit"
+                    "Up/Down: Switch mode | Enter: Show top packages | Ctrl+C: Quit"
                 ]
 
-            instr_y = mode_y + 5
+            instr_y = input_block_y + (3 if selected_mode == 0 else 2)
             for i, instruction in enumerate(instructions):
                 instr_x = (width - len(instruction)) // 2
                 if i == 0 and (search_submitted and not user_modified_after_submit):
@@ -1370,8 +1723,29 @@ class BrewInteractive:
                 else:
                     stdscr.addstr(instr_y + i, instr_x, instruction)
 
-            # Show loading progress if downloading
-            if self.is_loading and not self.is_data_loaded:
+            # Show loading progress or errors
+            if self.load_error and not self.is_loading and not self.is_data_loaded:
+                error_text = f"Download failed: {self.load_error}"
+                error_x = max(0, (width - len(error_text)) // 2)
+                error_y = instr_y + len(instructions) + 1
+                if error_y < height - 2:
+                    try:
+                        stdscr.addstr(
+                            error_y,
+                            error_x,
+                            error_text[: max(0, width - 2)],
+                            curses.A_BOLD,
+                        )
+                    except curses.error:
+                        pass
+                retry_text = "Press r to retry or Ctrl+C to quit"
+                retry_x = (width - len(retry_text)) // 2
+                if error_y + 1 < height - 2:
+                    try:
+                        stdscr.addstr(error_y + 1, retry_x, retry_text, curses.A_DIM)
+                    except curses.error:
+                        pass
+            elif self.is_loading and not self.is_data_loaded:
                 with self.progress_lock:
                     current = self.download_progress["current"]
                     total = self.download_progress["total"]
@@ -1442,7 +1816,7 @@ class BrewInteractive:
 
             # Move cursor to correct position (only if in search mode)
             if selected_mode == 0:
-                stdscr.move(mode_y + 2, cursor_x)
+                stdscr.move(input_y, cursor_x)
             stdscr.refresh()
 
             # Get input (non-blocking with timeout)
@@ -1462,6 +1836,17 @@ class BrewInteractive:
                 stdscr.timeout(-1)  # Reset to blocking
                 curses.curs_set(0)
                 return None
+            if (
+                ch in (ord("r"), ord("R"))
+                and self.load_error
+                and not self.is_loading
+                and not self.is_data_loaded
+            ):
+                self.load_error = None
+                thread = threading.Thread(target=self._background_load_data)
+                thread.daemon = True
+                thread.start()
+                continue
 
             # Handle mode navigation
             if ch == curses.KEY_UP:
