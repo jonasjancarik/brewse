@@ -34,16 +34,16 @@ jobs:
           echo "sha256=$SHA256" >> $GITHUB_OUTPUT
           echo "Calculated SHA256: $SHA256"
 
-      - name: Checkout homebrew-brewse repository
+      - name: Checkout homebrew-tap repository
         uses: actions/checkout@v4
         with:
-          repository: jonasjancarik/homebrew-brewse
+          repository: jonasjancarik/homebrew-tap
           token: ${{ secrets.TAP_UPDATE_TOKEN }}
-          path: homebrew-brewse
+          path: homebrew-tap
 
       - name: Update formula
         run: |
-          cd homebrew-brewse
+          cd homebrew-tap
           VERSION="${{ steps.version.outputs.version }}"
           SHA256="${{ steps.sha256.outputs.sha256 }}"
           URL="https://files.pythonhosted.org/packages/source/b/brewse/brewse-${VERSION}.tar.gz"
@@ -57,7 +57,7 @@ jobs:
 
       - name: Commit and push changes
         run: |
-          cd homebrew-brewse
+          cd homebrew-tap
           VERSION="${{ steps.version.outputs.version }}"
           SHA256="${{ steps.sha256.outputs.sha256 }}"
           
@@ -80,4 +80,3 @@ jobs:
           echo "Users can now update with:"
           echo "  brew update"
           echo "  brew upgrade brewse"
-

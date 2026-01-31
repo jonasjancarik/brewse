@@ -7,7 +7,7 @@ An interactive TUI (Terminal User Interface) browser for Homebrew packages. Brew
 ### Using Homebrew (recommended)
 
 ```bash
-brew install jonasjancarik/brewse/brewse
+brew install jonasjancarik/tap/brewse
 ```
 
 ## Usage
@@ -86,7 +86,7 @@ The GitHub Action will automatically:
 - Download the tarball from PyPI
 - Calculate the SHA256 hash
 - Update the Homebrew tap formula
-- Push changes to the `homebrew-brewse` repository
+- Push changes to the `homebrew-tap` repository
 
 See [.github/AUTOMATION_SETUP.md](.github/AUTOMATION_SETUP.md) for setup details. (Useful if you want to fork this repo, obviously you will need to change the GitHub username.)
 
@@ -95,7 +95,7 @@ See [.github/AUTOMATION_SETUP.md](.github/AUTOMATION_SETUP.md) for setup details
 If needed, you can manually update the Homebrew tap:
 
 ```bash
-cd ~/homebrew-brewse
+cd ~/homebrew-tap
 ./update-formula.sh 0.1.3
 ```
 

@@ -1,12 +1,12 @@
 # GitHub Action Automation Setup
 
-This GitHub Action automatically updates the Homebrew tap (`homebrew-brewse`) whenever you create a new release.
+This GitHub Action automatically updates the Homebrew tap (`homebrew-tap`) whenever you create a new release.
 
 ## Setup Instructions
 
 ### 1. Create a Personal Access Token (PAT)
 
-The action needs permission to push to the `homebrew-brewse` repository.
+The action needs permission to push to the `homebrew-tap` repository.
 
 1. Go to https://github.com/settings/tokens?type=beta
 2. Click "Generate new token" (Fine-grained tokens)
@@ -14,7 +14,7 @@ The action needs permission to push to the `homebrew-brewse` repository.
    - **Token name**: `brewse-tap-updater`
    - **Expiration**: 1 year (or custom)
    - **Repository access**: Select "Only select repositories"
-     - Choose: `your-username/homebrew-brewse`
+     - Choose: `your-username/homebrew-tap`
    - **Permissions** → Repository permissions:
      - Contents: **Read and write**
 4. Click "Generate token"
@@ -92,7 +92,6 @@ View logs at: https://github.com/jonasjancarik/brewse/actions
 If the automation fails, you can still update manually:
 
 ```bash
-cd ~/homebrew-brewse
+cd ~/homebrew-tap
 ./update-formula.sh 0.1.3
 ```
-
