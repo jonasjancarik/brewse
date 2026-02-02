@@ -79,7 +79,7 @@ Brewse uses automated releases with GitHub Actions:
    ```
 3. **Create a GitHub release:**
    ```bash
-   gh release create v0.1.3 --generate-notes
+   gh release create v0.3.0 --generate-notes
    ```
 
 The GitHub Action will automatically:
@@ -96,7 +96,7 @@ If needed, you can manually update the Homebrew tap:
 
 ```bash
 cd ~/homebrew-tap
-./update-formula.sh 0.1.3
+./update-formula.sh 0.3.0
 ```
 
 ## License
