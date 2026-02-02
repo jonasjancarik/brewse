@@ -14,7 +14,7 @@ jobs:
           # Remove 'v' prefix if present
           VERSION="${GITHUB_REF#refs/tags/}"
           VERSION="${VERSION#v}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Extracted version: $VERSION"
 
       - name: Download tarball and calculate SHA256
@@ -31,7 +31,7 @@ jobs:
             exit 1
           fi
           
-          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
           echo "Calculated SHA256: $SHA256"
 
       - name: Checkout homebrew-tap repository
@@ -65,11 +65,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
           git add Formula/brewse.rb
-          git commit -m "Update brewse to v${VERSION}
-
-- Updated tarball URL for version ${VERSION}
-- Updated SHA256 hash: ${SHA256}
-- Automated update from release workflow"
+          git commit -m "Update brewse to v${VERSION}" \
+            -m "- Updated tarball URL for version ${VERSION}" \
+            -m "- Updated SHA256 hash: ${SHA256}" \
+            -m "- Automated update from release workflow"
           
           git push
 
