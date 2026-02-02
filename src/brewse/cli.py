@@ -1029,7 +1029,7 @@ class BrewInteractive:
         if self.showing_top_packages:
             footer = "↑/↓: Navigate | Enter: Show Info | q: Quit | i: Install | /: Search | h: Help"
         else:
-            footer = "↑/↓: Navigate | Enter: Show Info | q: Quit | i: Install | n: New Search | t: Top Packages | h: Help"
+            footer = "↑/↓: Navigate | Enter: Show Info | Backspace: Delete | q: Quit | i: Install | n: New Search | t: Top Packages | h: Help"
         if self.last_command_output:
             footer += " | o: Output"
         try:
