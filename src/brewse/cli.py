@@ -52,6 +52,8 @@ class BrewInteractive:
         self.is_data_loaded = False
         self.is_loading = False
         self.load_error = None
+        self.stale_cache_ages: Dict[str, float] = {}
+        self.refresh_in_progress = False
         self.request_search_input = False  # Signal to re-open search prompt
         # Progress tracking
         self.download_progress = {"current": 0, "total": 0, "file": ""}
@@ -76,6 +78,7 @@ class BrewInteractive:
         self.last_command_output = None
         self.output_scroll_offset = 0
         self.previous_view_mode = None
+        self.top_limit = 100
 
     def _get_cache_path(self, url: str) -> Path:
         """Generate a cache file path from URL."""
@@ -94,6 +97,48 @@ class BrewInteractive:
                 return int(content_length) if content_length else 0
         except Exception:
             return 0
+
+    def _format_age(self, seconds: float) -> str:
+        """Format an age in seconds into a short human-readable string."""
+        total_seconds = max(0, int(seconds))
+        minutes, secs = divmod(total_seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        days, hours = divmod(hours, 24)
+        if days > 0:
+            return f"{days}d {hours}h" if hours else f"{days}d"
+        if hours > 0:
+            return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+        if minutes > 0:
+            return f"{minutes}m"
+        return f"{secs}s"
+
+    def _stale_cache_message(self) -> Optional[str]:
+        """Return a banner message if stale cache data is in use."""
+        if not self.stale_cache_ages:
+            return None
+        max_age = max(self.stale_cache_ages.values())
+        age_text = self._format_age(max_age)
+        return f"Using cached data (age: {age_text}). Press r to retry download."
+
+    def _load_stale_cache(self, cache_path: Path, url: str) -> Optional[dict]:
+        """Load stale cache data if available and record its age."""
+        if not cache_path.exists():
+            return None
+        try:
+            with open(cache_path) as f:
+                cached_data = json.load(f)
+            data = cached_data.get("data")
+            if data is None:
+                return None
+            timestamp = cached_data.get("timestamp")
+            if timestamp:
+                age_seconds = datetime.now().timestamp() - float(timestamp)
+                self.stale_cache_ages[url] = max(0, age_seconds)
+            else:
+                self.stale_cache_ages[url] = 0
+            return data
+        except Exception:
+            return None
 
     def _fetch_json(self, url: str, track_progress: bool = False) -> dict:
         """Helper method to fetch and parse JSON from URL with caching."""
@@ -166,12 +211,19 @@ class BrewInteractive:
                         raise Exception(
                             "Invalid JSON response. Retry the download or clear cache."
                         )
-        except urllib.error.URLError as e:
-            raise Exception(
-                f"Network error: {e.reason}. Check your internet connection."
-            )
-        except TimeoutError:
-            raise Exception("Request timed out. Server may be slow or unreachable.")
+        except Exception as e:
+            stale_data = self._load_stale_cache(cache_path, url)
+            if stale_data is not None:
+                return stale_data
+            if isinstance(e, urllib.error.URLError):
+                raise Exception(
+                    f"Network error: {e.reason}. Check your internet connection."
+                )
+            if isinstance(e, TimeoutError):
+                raise Exception(
+                    "Request timed out. Server may be slow or unreachable."
+                )
+            raise Exception(str(e))
 
         # Cache the data
         cache_data = {"timestamp": datetime.now().timestamp(), "data": data}
@@ -182,9 +234,12 @@ class BrewInteractive:
 
     def _background_load_data(self):
         """Load initial API data in background."""
+        had_data = self.is_data_loaded
+        previous_stale_cache_ages = dict(self.stale_cache_ages)
         try:
             self.is_loading = True
             self.load_error = None
+            self.stale_cache_ages = {}
 
             # Get file sizes first
             formula_url = f"{self.api_base_url}/formula.json"
@@ -214,7 +269,10 @@ class BrewInteractive:
             self.is_data_loaded = True
         except Exception as e:
             self.load_error = str(e)
-            self.is_data_loaded = False
+            if not had_data:
+                self.is_data_loaded = False
+            if had_data and not self.stale_cache_ages:
+                self.stale_cache_ages = previous_stale_cache_ages
         finally:
             self.is_loading = False
 
@@ -459,6 +517,7 @@ class BrewInteractive:
             limit: Number of top packages to return
         """
         # Reset position
+        self.top_limit = limit
         self.selected_index = 0
         self.scroll_offset = 0
         self.search_term = ""  # Empty search term for top packages view
@@ -959,8 +1018,15 @@ class BrewInteractive:
         stdscr.addstr(current_line, 2 + len(search_info) + 1, count_info, curses.A_DIM)
         current_line += 2
 
+        status_line = None
+        if self.refresh_in_progress and self.is_loading:
+            status_line = "Refreshing package data..."
+        else:
+            status_line = self._stale_cache_message()
+
+        footer_lines = 2 if status_line else 1
         # Calculate available lines for results
-        available_lines = height - current_line - 1  # -1 for footer
+        available_lines = max(0, height - current_line - footer_lines)  # footer + status
 
         # Sort packages: by analytics if showing top packages, otherwise alphabetically
         if self.showing_top_packages:
@@ -970,7 +1036,7 @@ class BrewInteractive:
             self.packages.sort(key=lambda p: p.name.lower())
 
         # Adjust scroll_offset to keep selected item visible
-        visible_area = available_lines - 2  # Account for search term line
+        visible_area = max(1, available_lines - 2)  # Account for search term line
         if self.selected_index - self.scroll_offset >= visible_area:
             self.scroll_offset = self.selected_index - visible_area + 1
         elif self.selected_index < self.scroll_offset:
@@ -984,9 +1050,10 @@ class BrewInteractive:
         current_package_idx = 0
         visible_line = 0
 
+        list_bottom = height - footer_lines
         for package in self.packages:
             if visible_line >= self.scroll_offset:
-                if current_line >= height - 1:
+                if current_line >= list_bottom:
                     break
                 prefix = "✔ " if package.installed else "  "
                 # Make the category suffix gray
@@ -1032,6 +1099,13 @@ class BrewInteractive:
             footer = "↑/↓: Navigate | Enter: Show Info | Backspace: Delete | q: Quit | i: Install | n: New Search | t: Top Packages | h: Help"
         if self.last_command_output:
             footer += " | o: Output"
+        if status_line:
+            try:
+                stdscr.addstr(
+                    height - 2, 0, status_line[: width - 1], curses.A_DIM
+                )
+            except curses.error:
+                pass
         try:
             stdscr.addstr(height - 1, 0, footer[: width - 1], curses.A_BOLD)
         except curses.error:
@@ -1105,6 +1179,7 @@ class BrewInteractive:
             "  q         Quit",
             "  h or ?    Help",
             "  o         Show last command output",
+            "  r         Retry download (when using cached data)",
             "  / or n    New search",
             "  ← or ⌫    Back",
             "",
@@ -1436,6 +1511,18 @@ class BrewInteractive:
 
         if key == ord("q"):
             return False
+        elif key in (ord("r"), ord("R")):
+            if (
+                self.view_mode == "search"
+                and self.stale_cache_ages
+                and not self.is_loading
+                and not self.refresh_in_progress
+            ):
+                self.refresh_in_progress = True
+                thread = threading.Thread(target=self._background_load_data)
+                thread.daemon = True
+                thread.start()
+            return True
         elif key in (ord("\b"), curses.KEY_BACKSPACE, 127, 8):
             if self.view_mode == "info":
                 self.view_mode = "search"
@@ -1605,6 +1692,12 @@ class BrewInteractive:
             self.draw_screen(stdscr)
             if not self.handle_input(stdscr):
                 break
+            if self.refresh_in_progress and not self.is_loading:
+                self.refresh_in_progress = False
+                if self.showing_top_packages:
+                    self.load_top_packages(limit=self.top_limit)
+                elif self.search_term:
+                    self.run_brew_search(self.search_term)
 
     def _search_input_flow(self, stdscr) -> Optional[str]:
         """Render mode selection/search prompt and collect input; return the term, 'TOP_PACKAGES', or None."""
