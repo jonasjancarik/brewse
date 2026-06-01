@@ -10,6 +10,16 @@ An interactive TUI (Terminal User Interface) browser for Homebrew packages. Brew
 brew install jonasjancarik/tap/brewse
 ```
 
+The Homebrew formula warms Brewse's package cache during installation. To keep
+the cache warm automatically, enable the optional daily refresh service:
+
+```bash
+brew services start brewse
+```
+
+`brew install` does not start the background service by itself; use
+`brew services start brewse` only if you want the daily refresh.
+
 ## Usage
 
 Launch Brewse in one of two ways:
@@ -30,12 +40,16 @@ brewse <search-term>
 brewse --help            # Show all available options
 brewse --version         # Show version number
 brewse --refresh         # Force refresh of cached package data
+brewse --prefetch        # Download package data into the cache and exit
 brewse --clear-cache     # Clear all cached data and exit
 ```
 
 ## Cache
 
 Brewse caches package data in `~/.cache/brewse/` to improve performance. Cache entries expire after 24 hours.
+
+`brewse --prefetch` refreshes the same cache without starting the TUI. This is
+intended for Homebrew's install hook and optional `brew services` daily refresh.
 
 ## Alternative Installation Methods
 
@@ -79,7 +93,7 @@ Brewse uses automated releases with GitHub Actions:
    ```
 3. **Create a GitHub release:**
    ```bash
-   gh release create v0.3.0 --generate-notes
+   gh release create v0.4.0 --generate-notes
    ```
 
 The GitHub Action will automatically:
@@ -96,7 +110,7 @@ If needed, you can manually update the Homebrew tap:
 
 ```bash
 cd ~/homebrew-tap
-./update-formula.sh 0.3.0
+./update-formula.sh 0.4.0
 ```
 
 ## License

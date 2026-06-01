@@ -66,7 +66,9 @@ That's it! The GitHub Action will:
 2. ✅ Download the tarball from PyPI
 3. ✅ Calculate the SHA256 hash
 4. ✅ Update `Formula/brewse.rb` in the tap repo
-5. ✅ Commit and push the changes
+5. ✅ Ensure the formula warms the cache in `post_install`
+6. ✅ Ensure `brew services start brewse` runs a daily cache refresh
+7. ✅ Commit and push the changes
 
 Users can then update with:
 ```bash
@@ -95,3 +97,6 @@ If the automation fails, you can still update manually:
 cd ~/homebrew-tap
 ./update-formula.sh 0.1.3
 ```
+
+Make sure `Formula/brewse.rb` keeps the `post_install` cache prefetch and
+`service do` interval refresh blocks when updating manually.

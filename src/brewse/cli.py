@@ -14,6 +14,8 @@ import threading
 import time
 import argparse
 import shutil
+import tempfile
+
 # termios and tty previously used for manual exit handling; no longer needed
 
 
@@ -23,11 +25,13 @@ class BrewPackage:
     category: str  # 'Formulae' or 'Casks'
     installed: bool = False
     analytics_30d: int = 0  # 30-day install count for sorting
+    upgradeable: bool = False
 
 
 @dataclass
 class PackageInfo:
     name: str
+    category: Optional[str] = None
     version: Optional[str] = None
     description: Optional[str] = None
     homepage: Optional[str] = None
@@ -45,6 +49,7 @@ class BrewInteractive:
         self.current_package_info: Optional[PackageInfo] = None
         self.search_term = ""
         self.showing_top_packages = False  # Track if we're showing top packages
+        self.showing_installed = False  # Track if we're showing installed packages
         self.api_base_url = "https://formulae.brew.sh/api"
         # Add cache directory
         self.cache_dir = Path.home() / ".cache" / "brewse"
@@ -65,6 +70,16 @@ class BrewInteractive:
         # Cache installed packages lists
         self._installed_formulae = None
         self._installed_casks = None
+        # Cache upgradeable packages lists
+        self._upgradeable_formulae = None
+        self._upgradeable_casks = None
+        self.upgradeable_check_error = None
+        # Installed view loading state
+        self.installed_load_in_progress = False
+        self.installed_load_error = None
+        self.installed_prefetch_in_progress = False
+        self.installed_data_lock = threading.Lock()
+        self.upgradeable_load_in_progress = False
         # Cache bulk analytics data
         self._formulae_analytics = None
         self._casks_analytics = None
@@ -87,6 +102,39 @@ class BrewInteractive:
             url.replace("https://", "").replace("/", "_").replace(".", "_") + ".json"
         )
         return self.cache_dir / filename
+
+    def _package_data_urls(self) -> List[str]:
+        """Return the bulk package data URLs needed for startup search."""
+        return [
+            f"{self.api_base_url}/formula.json",
+            f"{self.api_base_url}/cask.json",
+        ]
+
+    def _write_cache(self, cache_path: Path, data) -> None:
+        """Write cache data atomically so interrupted refreshes do not corrupt it."""
+        cache_data = {"timestamp": datetime.now().timestamp(), "data": data}
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                dir=cache_path.parent,
+                prefix=f".{cache_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+                json.dump(cache_data, tmp_file)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+            tmp_path.replace(cache_path)
+        finally:
+            if tmp_path and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
 
     def _get_file_size(self, url: str) -> int:
         """Get file size using HEAD request."""
@@ -226,11 +274,47 @@ class BrewInteractive:
             raise Exception(str(e))
 
         # Cache the data
-        cache_data = {"timestamp": datetime.now().timestamp(), "data": data}
-        with open(cache_path, "w") as f:
-            json.dump(cache_data, f)
+        self._write_cache(cache_path, data)
 
         return data
+
+    def prefetch_package_data(self) -> bool:
+        """Refresh the bulk package data cache without starting the TUI."""
+        self.stale_cache_ages = {}
+        self.load_error = None
+
+        urls = self._package_data_urls()
+        labels = {
+            f"{self.api_base_url}/formula.json": "formulae",
+            f"{self.api_base_url}/cask.json": "casks",
+        }
+
+        for url in urls:
+            label = labels.get(url, url)
+            try:
+                was_fresh = self._is_cache_fresh(url)
+                data = self._fetch_json(url)
+                count_text = (
+                    f"{len(data)} {label}" if hasattr(data, "__len__") else label
+                )
+                if url in self.stale_cache_ages:
+                    age_text = self._format_age(self.stale_cache_ages[url])
+                    print(
+                        f"Using existing {label} cache ({count_text}, age: {age_text})"
+                    )
+                elif was_fresh:
+                    print(f"Using fresh {label} cache ({count_text})")
+                else:
+                    print(f"✓ Cached {count_text}")
+            except Exception as e:
+                self.load_error = str(e)
+                print(f"Failed to cache {label}: {e}")
+                return False
+
+        stale_message = self._stale_cache_message()
+        if stale_message:
+            print(stale_message)
+        return True
 
     def _background_load_data(self):
         """Load initial API data in background."""
@@ -242,8 +326,7 @@ class BrewInteractive:
             self.stale_cache_ages = {}
 
             # Get file sizes first
-            formula_url = f"{self.api_base_url}/formula.json"
-            cask_url = f"{self.api_base_url}/cask.json"
+            formula_url, cask_url = self._package_data_urls()
 
             # Check if we need to download (not in cache or stale)
             formula_cached = self._is_cache_fresh(formula_url)
@@ -294,35 +377,139 @@ class BrewInteractive:
 
     def _get_installed_packages(self):
         """Get all installed packages once and cache them."""
-        if self._installed_formulae is None:
-            try:
-                result = subprocess.run(
-                    ["brew", "list", "--formula"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if result.returncode == 0:
-                    self._installed_formulae = set(result.stdout.strip().split("\n"))
-                else:
+        with self.installed_data_lock:
+            if self._installed_formulae is None:
+                try:
+                    result = subprocess.run(
+                        ["brew", "list", "--formula"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if result.returncode == 0:
+                        self._installed_formulae = set(
+                            result.stdout.strip().split("\n")
+                        )
+                    else:
+                        self._installed_formulae = set()
+                except Exception:
                     self._installed_formulae = set()
-            except Exception:
-                self._installed_formulae = set()
 
-        if self._installed_casks is None:
-            try:
-                result = subprocess.run(
-                    ["brew", "list", "--cask"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if result.returncode == 0:
-                    self._installed_casks = set(result.stdout.strip().split("\n"))
-                else:
+            if self._installed_casks is None:
+                try:
+                    result = subprocess.run(
+                        ["brew", "list", "--cask"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if result.returncode == 0:
+                        self._installed_casks = set(result.stdout.strip().split("\n"))
+                    else:
+                        self._installed_casks = set()
+                except Exception:
                     self._installed_casks = set()
-            except Exception:
-                self._installed_casks = set()
+
+    def _get_upgradeable_packages(self) -> None:
+        """Get upgradeable packages once and cache them."""
+        with self.installed_data_lock:
+            self.upgradeable_check_error = None
+
+            if self._upgradeable_formulae is None:
+                try:
+                    result = subprocess.run(
+                        ["brew", "outdated", "--formula", "--quiet"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    if result.returncode == 0:
+                        names = [
+                            line.split()[0]
+                            for line in (result.stdout or "").splitlines()
+                            if line.strip()
+                        ]
+                        self._upgradeable_formulae = set(names)
+                    else:
+                        self._upgradeable_formulae = set()
+                        error_line = (
+                            result.stderr or result.stdout or ""
+                        ).strip().splitlines()
+                        if error_line:
+                            self.upgradeable_check_error = error_line[-1]
+                except Exception as e:
+                    self._upgradeable_formulae = set()
+                    self.upgradeable_check_error = str(e)
+
+            if self._upgradeable_casks is None:
+                try:
+                    result = subprocess.run(
+                        ["brew", "outdated", "--cask", "--quiet"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    if result.returncode == 0:
+                        names = [
+                            line.split()[0]
+                            for line in (result.stdout or "").splitlines()
+                            if line.strip()
+                        ]
+                        self._upgradeable_casks = set(names)
+                    else:
+                        self._upgradeable_casks = set()
+                        error_line = (
+                            result.stderr or result.stdout or ""
+                        ).strip().splitlines()
+                        if error_line and not self.upgradeable_check_error:
+                            self.upgradeable_check_error = error_line[-1]
+                except Exception as e:
+                    self._upgradeable_casks = set()
+                    if not self.upgradeable_check_error:
+                        self.upgradeable_check_error = str(e)
+
+    def _apply_upgradeable_flags(self) -> None:
+        """Apply upgradeable flags to current package list."""
+        if not self.packages:
+            return
+        for package in self.packages:
+            if not package.installed:
+                package.upgradeable = False
+                continue
+            if package.category == "Formulae":
+                package.upgradeable = bool(self._upgradeable_formulae) and (
+                    package.name in self._upgradeable_formulae
+                )
+            else:
+                package.upgradeable = bool(self._upgradeable_casks) and (
+                    package.name in self._upgradeable_casks
+                )
+
+    def _is_upgradeable(self, package: BrewPackage) -> bool:
+        if package.category == "Formulae":
+            return bool(self._upgradeable_formulae) and package.name in self._upgradeable_formulae
+        return bool(self._upgradeable_casks) and package.name in self._upgradeable_casks
+
+    def _is_upgradeable_name(self, name: str, category: Optional[str]) -> bool:
+        if not category:
+            return False
+        if category == "Formulae":
+            return bool(self._upgradeable_formulae) and name in self._upgradeable_formulae
+        return bool(self._upgradeable_casks) and name in self._upgradeable_casks
+
+    def _installed_status_message(self) -> Optional[str]:
+        if self.upgradeable_check_error:
+            return f"Update check failed: {self.upgradeable_check_error}"
+        if self._upgradeable_formulae is None and self._upgradeable_casks is None:
+            return None
+        count = 0
+        if self._upgradeable_formulae:
+            count += len(self._upgradeable_formulae)
+        if self._upgradeable_casks:
+            count += len(self._upgradeable_casks)
+        if count == 0:
+            return "All installed packages are up to date."
+        return f"{count} package(s) have updates available (marked ↑)."
 
     def _load_analytics_data(self) -> None:
         """Load bulk analytics data for all formulae and casks."""
@@ -449,6 +636,8 @@ class BrewInteractive:
         # Reset position when performing new search
         self.selected_index = 0
         self.scroll_offset = 0
+        self.showing_top_packages = False
+        self.showing_installed = False
         self.search_term = term
         # Wait for data to be loaded if necessary
         while not self.is_data_loaded:
@@ -520,6 +709,8 @@ class BrewInteractive:
         self.top_limit = limit
         self.selected_index = 0
         self.scroll_offset = 0
+        self.showing_top_packages = True
+        self.showing_installed = False
         self.search_term = ""  # Empty search term for top packages view
 
         # Wait for data to be loaded if necessary
@@ -666,6 +857,119 @@ class BrewInteractive:
             print(f"Error loading top packages: {str(e)}")
             self.packages = []
 
+    def load_installed_packages(self, force_refresh: bool = False) -> None:
+        """Load installed packages."""
+        self.installed_load_error = None
+        self.selected_index = 0
+        self.scroll_offset = 0
+        self.search_term = ""
+        self.showing_installed = True
+        self.showing_top_packages = False
+
+        if force_refresh:
+            self._installed_formulae = None
+            self._installed_casks = None
+
+        self._get_installed_packages()
+
+        self.packages = []
+        for name in sorted(self._installed_formulae or set()):
+            if not name:
+                continue
+            package = BrewPackage(name=name, category="Formulae", installed=True)
+            self.packages.append(package)
+
+        for name in sorted(self._installed_casks or set()):
+            if not name:
+                continue
+            package = BrewPackage(name=name, category="Casks", installed=True)
+            self.packages.append(package)
+        self.installed_load_error = None
+
+    def start_installed_load(
+        self, check_upgradeable: bool = True, force_refresh: bool = False
+    ) -> None:
+        """Load installed packages in the background to keep UI responsive."""
+        if self.installed_load_in_progress:
+            return
+
+        self.installed_load_error = None
+        self.selected_index = 0
+        self.scroll_offset = 0
+        self.search_term = ""
+        self.showing_installed = True
+        self.showing_top_packages = False
+        self.packages = []
+
+        self.installed_load_in_progress = True
+
+        # Best-effort: clear any buffered keystrokes when switching modes
+        try:
+            curses.flushinp()
+        except Exception:
+            pass
+
+        def _loader() -> None:
+            try:
+                self.load_installed_packages(force_refresh=force_refresh)
+                if check_upgradeable:
+                    self.start_upgradeable_load()
+            except Exception as e:
+                self.packages = []
+                self.installed_load_error = str(e)
+            finally:
+                self.installed_load_in_progress = False
+
+        thread = threading.Thread(target=_loader)
+        thread.daemon = True
+        thread.start()
+
+    def start_installed_prefetch(self, check_upgradeable: bool = True) -> None:
+        """Prefetch installed and upgradeable data without switching UI modes."""
+        if self.installed_prefetch_in_progress:
+            return
+
+        if self._installed_formulae is not None and self._installed_casks is not None:
+            if not check_upgradeable:
+                return
+            if (
+                self._upgradeable_formulae is not None
+                and self._upgradeable_casks is not None
+            ):
+                return
+
+        self.installed_prefetch_in_progress = True
+
+        def _prefetch() -> None:
+            try:
+                self._get_installed_packages()
+                if check_upgradeable:
+                    self._get_upgradeable_packages()
+            finally:
+                self.installed_prefetch_in_progress = False
+
+        thread = threading.Thread(target=_prefetch)
+        thread.daemon = True
+        thread.start()
+
+    def start_upgradeable_load(self) -> None:
+        """Load upgradeable packages in the background and update flags."""
+        if self.upgradeable_load_in_progress:
+            return
+
+        self.upgradeable_load_in_progress = True
+
+        def _loader() -> None:
+            try:
+                self._get_upgradeable_packages()
+                self._apply_upgradeable_flags()
+            finally:
+                self.upgradeable_load_in_progress = False
+
+        thread = threading.Thread(target=_loader)
+        thread.daemon = True
+        thread.start()
+
     def get_package_info(self, package: BrewPackage) -> PackageInfo:
         """Fetch package information using the Homebrew API."""
         try:
@@ -675,7 +979,7 @@ class BrewInteractive:
 
             data = self._fetch_json(url)
 
-            info = PackageInfo(name=package.name)
+            info = PackageInfo(name=package.name, category=package.category)
 
             if endpoint == "formula":
                 info.version = data.get("versions", {}).get("stable")
@@ -999,14 +1303,28 @@ class BrewInteractive:
 
     def draw_search_results(self, stdscr, height: int, width: int) -> None:
         """Draw the search results screen."""
-        if self.showing_top_packages:
+        if self.showing_installed:
+            title = "Brewse: Installed Packages"
+        elif self.showing_top_packages:
             title = "Brewse: Top Packages (Not Installed)"
         else:
             title = "Brewse: Homebrew Search"
         current_line = self.draw_header(stdscr, title, width)
 
         # Draw search term and result count
-        if self.showing_top_packages:
+        if self.showing_installed:
+            search_info = "Installed packages"
+            if self.installed_load_in_progress and not self.packages:
+                count_info = "(loading...)"
+            else:
+                upgradeable_count = len(
+                    [p for p in self.packages if p.installed and p.upgradeable]
+                )
+                if upgradeable_count:
+                    count_info = f"({len(self.packages)} installed, {upgradeable_count} updates)"
+                else:
+                    count_info = f"({len(self.packages)} installed)"
+        elif self.showing_top_packages:
             search_info = "Top packages by popularity (30-day installs)"
             count_info = f"({len(self.packages)} shown)"
         else:
@@ -1019,10 +1337,20 @@ class BrewInteractive:
         current_line += 2
 
         status_line = None
-        if self.refresh_in_progress and self.is_loading:
-            status_line = "Refreshing package data..."
+        if self.showing_installed:
+            if self.installed_load_in_progress:
+                status_line = "Loading installed packages..."
+            elif self.upgradeable_load_in_progress:
+                status_line = "Checking for updates..."
+            elif self.installed_load_error:
+                status_line = f"Failed to load installed packages: {self.installed_load_error}"
+            else:
+                status_line = self._installed_status_message()
         else:
-            status_line = self._stale_cache_message()
+            if self.refresh_in_progress and self.is_loading:
+                status_line = "Refreshing package data..."
+            else:
+                status_line = self._stale_cache_message()
 
         footer_lines = 2 if status_line else 1
         # Calculate available lines for results
@@ -1051,52 +1379,74 @@ class BrewInteractive:
         visible_line = 0
 
         list_bottom = height - footer_lines
-        for package in self.packages:
-            if visible_line >= self.scroll_offset:
-                if current_line >= list_bottom:
-                    break
-                prefix = "✔ " if package.installed else "  "
-                # Make the category suffix gray
-                category_suffix = (
-                    "(formula)" if package.category == "Formulae" else "(cask)"
-                )
-
-                # Format package line with analytics if showing top packages
-                if self.showing_top_packages and package.analytics_30d > 0:
-                    analytics_suffix = f" ({package.analytics_30d:,} installs)"
-                else:
-                    analytics_suffix = ""
-
-                if current_package_idx == self.selected_index:
-                    # Selected line
-                    stdscr.addstr(
-                        current_line, 4, prefix + package.name, curses.A_REVERSE
-                    )
-                    stdscr.addstr(
-                        current_line,
-                        4 + len(prefix + package.name) + 1,
-                        category_suffix + analytics_suffix,
-                        curses.A_REVERSE | curses.A_DIM,
-                    )
-                else:
-                    # Normal line
-                    stdscr.addstr(current_line, 4, prefix + package.name)
-                    stdscr.addstr(
-                        current_line,
-                        4 + len(prefix + package.name) + 1,
-                        category_suffix + analytics_suffix,
-                        curses.A_DIM,
+        if self.showing_installed and self.installed_load_in_progress:
+            message = "Loading installed packages..."
+            message_x = max(0, (width - len(message)) // 2)
+            message_y = current_line + max(0, (available_lines // 2) - 1)
+            try:
+                stdscr.addstr(message_y, message_x, message, curses.A_DIM)
+            except curses.error:
+                pass
+        elif self.showing_installed and self.installed_load_error:
+            message = "Failed to load installed packages."
+            message_x = max(0, (width - len(message)) // 2)
+            message_y = current_line + max(0, (available_lines // 2) - 1)
+            try:
+                stdscr.addstr(message_y, message_x, message, curses.A_DIM)
+            except curses.error:
+                pass
+        else:
+            for package in self.packages:
+                if visible_line >= self.scroll_offset:
+                    if current_line >= list_bottom:
+                        break
+                    if package.installed and package.upgradeable:
+                        prefix = "↑ "
+                    else:
+                        prefix = "✔ " if package.installed else "  "
+                    # Make the category suffix gray
+                    category_suffix = (
+                        "(formula)" if package.category == "Formulae" else "(cask)"
                     )
 
-                current_line += 1
-            current_package_idx += 1
-            visible_line += 1
+                    # Format package line with analytics if showing top packages
+                    if self.showing_top_packages and package.analytics_30d > 0:
+                        analytics_suffix = f" ({package.analytics_30d:,} installs)"
+                    else:
+                        analytics_suffix = ""
+
+                    if current_package_idx == self.selected_index:
+                        # Selected line
+                        stdscr.addstr(
+                            current_line, 4, prefix + package.name, curses.A_REVERSE
+                        )
+                        stdscr.addstr(
+                            current_line,
+                            4 + len(prefix + package.name) + 1,
+                            category_suffix + analytics_suffix,
+                            curses.A_REVERSE | curses.A_DIM,
+                        )
+                    else:
+                        # Normal line
+                        stdscr.addstr(current_line, 4, prefix + package.name)
+                        stdscr.addstr(
+                            current_line,
+                            4 + len(prefix + package.name) + 1,
+                            category_suffix + analytics_suffix,
+                            curses.A_DIM,
+                        )
+
+                    current_line += 1
+                current_package_idx += 1
+                visible_line += 1
 
         # Update footer
-        if self.showing_top_packages:
-            footer = "↑/↓: Navigate | Enter: Show Info | q: Quit | i: Install | /: Search | h: Help"
+        if self.showing_installed:
+            footer = "↑/↓: Navigate | Enter: Show Info | q: Quit | u: Update | x: Uninstall | /: Search | t: Top Packages | h: Help"
+        elif self.showing_top_packages:
+            footer = "↑/↓: Navigate | Enter: Show Info | q: Quit | i: Install | u: Update | /: Search | l: Installed | h: Help"
         else:
-            footer = "↑/↓: Navigate | Enter: Show Info | Backspace: Delete | q: Quit | i: Install | n: New Search | t: Top Packages | h: Help"
+            footer = "↑/↓: Navigate | Enter: Show Info | Backspace: Delete | q: Quit | i: Install | u: Update | n: New Search | t: Top Packages | l: Installed | h: Help"
         if self.last_command_output:
             footer += " | o: Output"
         if status_line:
@@ -1141,8 +1491,20 @@ class BrewInteractive:
             add_line("Status", "Installing...")
         elif self.operation_in_progress == "uninstalling":
             add_line("Status", "Uninstalling...")
+        elif self.operation_in_progress == "updating":
+            add_line("Status", "Updating...")
         else:
             add_line("Status", "✔ Installed" if info.installed else "Not installed")
+
+        if (
+            info.installed
+            and info.category
+            and (self._upgradeable_formulae is not None or self._upgradeable_casks is not None)
+        ):
+            if self._is_upgradeable_name(info.name, info.category):
+                add_line("Update", "Available")
+            else:
+                add_line("Update", "Up to date")
 
         if info.version:
             add_line("Version", info.version)
@@ -1160,7 +1522,7 @@ class BrewInteractive:
         if self.operation_in_progress:
             footer = "←: Back | h: Help | q: Quit (Operation in progress...)"
         else:
-            footer = "←: Back | i: Install | u: Uninstall | h: Help | q: Quit"
+            footer = "←: Back | i: Install | u: Update | x: Uninstall | h: Help | q: Quit"
         if self.last_command_output:
             footer += " | o: Output"
         try:
@@ -1179,8 +1541,9 @@ class BrewInteractive:
             "  q         Quit",
             "  h or ?    Help",
             "  o         Show last command output",
-            "  r         Retry download (when using cached data)",
+            "  r         Retry download / refresh installed list",
             "  / or n    New search",
+            "  l         Show installed packages",
             "  ← or ⌫    Back",
             "",
             "Search view:",
@@ -1188,13 +1551,21 @@ class BrewInteractive:
             "  PgUp/PgDn Page up/down",
             "  Enter     Show package info",
             "  i         Install selected",
+            "  u         Update selected",
             "  t         Show top packages",
             "  / or n    New search",
             "",
             "Info view:",
             "  ←         Back to results",
             "  i         Install",
-            "  u         Uninstall",
+            "  u         Update",
+            "  x         Uninstall",
+            "",
+            "Installed view:",
+            "  ↑/↓       Navigate",
+            "  u         Update",
+            "  x         Uninstall",
+            "  ↑ marker  Update available",
             "",
             "Output view:",
             "  ↑/↓       Scroll",
@@ -1354,6 +1725,9 @@ class BrewInteractive:
                     self._installed_formulae = None
                 else:
                     self._installed_casks = None
+                self._upgradeable_formulae = None
+                self._upgradeable_casks = None
+                self.upgradeable_check_error = None
 
             if self.view_mode == "search":
                 package.installed = True if success else package.installed
@@ -1369,6 +1743,122 @@ class BrewInteractive:
         self.draw_screen(self.stdscr)
 
         # Show transient message at footer area
+        try:
+            height, width = self.stdscr.getmaxyx()
+            self.stdscr.addstr(
+                height - 2, 0, (message[: width - 1]).ljust(width - 1), curses.A_BOLD
+            )
+            self.stdscr.refresh()
+        except Exception:
+            pass
+
+    def update_package(self) -> None:
+        """Update the currently selected package."""
+        # Block if another operation is in progress
+        if self.operation_in_progress:
+            return
+
+        if self.view_mode == "search":
+            package = self.packages[self.selected_index]
+        else:
+            package = next(
+                p for p in self.packages if p.name == self.current_package_info.name
+            )
+
+        run_interactive = False
+        sudo_reason = self._maybe_requires_sudo(package)
+        if sudo_reason:
+            confirm_lines = [
+                "Update may require sudo.",
+                f"Reason: {sudo_reason}",
+                "Run in terminal now? (y/n)",
+            ]
+            if not self._prompt_confirm(confirm_lines):
+                message = f"Update cancelled for {package.name}"
+                self._record_command_output(
+                    f"brew upgrade {package.name}", message, ""
+                )
+                self.draw_screen(self.stdscr)
+                try:
+                    height, width = self.stdscr.getmaxyx()
+                    self.stdscr.addstr(
+                        height - 2,
+                        0,
+                        (message[: width - 1]).ljust(width - 1),
+                        curses.A_BOLD,
+                    )
+                    self.stdscr.refresh()
+                except Exception:
+                    pass
+                return
+            run_interactive = True
+
+        # Set operation flag and refresh screen
+        self.operation_in_progress = "updating"
+        self.draw_screen(self.stdscr)
+        self.stdscr.refresh()
+
+        args = ["brew", "upgrade"]
+        if package.category == "Casks":
+            args.append("--cask")
+        args.append(package.name)
+
+        try:
+            if run_interactive:
+                result = self._run_command_interactive(args)
+                success = result.returncode == 0
+                message = (
+                    f"Updated {package.name}"
+                    if success
+                    else f"Update finished with errors for {package.name}"
+                )
+                self._record_command_output(
+                    " ".join(args),
+                    message,
+                    "",
+                    output_in_terminal=True,
+                )
+            else:
+                result = subprocess.run(args, capture_output=True, text=True)
+                success = result.returncode == 0
+                combined_output = (result.stdout or "") + (result.stderr or "")
+                output_lower = combined_output.lower()
+                if success:
+                    if "already up-to-date" in output_lower or "nothing to upgrade" in output_lower:
+                        message = f"No updates available for {package.name}"
+                    else:
+                        message = f"Updated {package.name}"
+                else:
+                    error_output = (result.stderr or result.stdout or "").strip()
+                    if error_output:
+                        error_line = error_output.splitlines()[-1]
+                        if len(error_line) > 120:
+                            error_line = f"{error_line[:117]}..."
+                    else:
+                        error_line = ""
+                    message = (
+                        f"Update failed: {error_line or 'see output'}"
+                    )
+                self._record_command_output(
+                    " ".join(args), message, combined_output
+                )
+        except Exception as e:
+            success = False
+            message = f"Update error: {e}"
+            self._record_command_output(" ".join(args), message, str(e))
+        finally:
+            # Clear operation flag
+            self.operation_in_progress = None
+
+        # Invalidate upgradeable cache after an update attempt
+        self._upgradeable_formulae = None
+        self._upgradeable_casks = None
+        self.upgradeable_check_error = None
+
+        # Refresh screen to show updated status
+        self.draw_screen(self.stdscr)
+
+        # Show transient message
         try:
             height, width = self.stdscr.getmaxyx()
             self.stdscr.addstr(
@@ -1480,6 +1970,9 @@ class BrewInteractive:
                     self._installed_formulae = None
                 else:
                     self._installed_casks = None
+                self._upgradeable_formulae = None
+                self._upgradeable_casks = None
+                self.upgradeable_check_error = None
 
             if self.view_mode == "search":
                 package.installed = False if success else package.installed
@@ -1509,9 +2002,21 @@ class BrewInteractive:
         height, width = stdscr.getmaxyx()
         key = stdscr.getch()
 
+        if self.showing_installed and self.installed_load_in_progress:
+            if key == ord("q"):
+                return False
+            if key == ord("h"):
+                self.view_mode = "help"
+            if key in (ord("r"), ord("R")):
+                self.start_installed_load(check_upgradeable=True, force_refresh=True)
+            return True
+
         if key == ord("q"):
             return False
         elif key in (ord("r"), ord("R")):
+            if self.view_mode == "search" and self.showing_installed:
+                self.start_installed_load(check_upgradeable=True, force_refresh=True)
+                return True
             if (
                 self.view_mode == "search"
                 and self.stale_cache_ages
@@ -1532,18 +2037,23 @@ class BrewInteractive:
                 self.selected_index = 0
                 self.view_mode = "search"
                 self.current_package_info = None
+                self.showing_installed = False
                 self.request_search_input = True
             return True
         elif key == ord("i"):
             if not self.operation_in_progress:
                 self.install_package()  # This will now handle everything including exit
-        elif key == ord("u"):
+        elif key in (ord("u"), ord("U")):
+            if not self.operation_in_progress:
+                self.update_package()
+        elif key in (ord("x"), ord("X")):
             if not self.operation_in_progress:
                 self.uninstall_package()  # This will now handle everything including exit
         elif key == ord("/"):  # Quick search
             self.scroll_offset = 0
             self.selected_index = 0
             self.showing_top_packages = False
+            self.showing_installed = False
             self.request_search_input = True
             return True
         elif key == ord("t"):  # Show top packages
@@ -1551,7 +2061,14 @@ class BrewInteractive:
                 self.scroll_offset = 0
                 self.selected_index = 0
                 self.showing_top_packages = True
+                self.showing_installed = False
                 self.load_top_packages(limit=100)
+            return True
+        elif key == ord("l"):  # Show installed packages
+            if self.view_mode == "search":
+                self.scroll_offset = 0
+                self.selected_index = 0
+                self.start_installed_load(check_upgradeable=True)
             return True
         elif key == ord("h"):  # Show help
             self.view_mode = "help"
@@ -1570,6 +2087,7 @@ class BrewInteractive:
             self.scroll_offset = 0  # Reset scroll offset
             self.selected_index = 0
             self.showing_top_packages = False
+            self.showing_installed = False
             self.request_search_input = True
             return True
         elif self.view_mode == "search":
@@ -1657,6 +2175,7 @@ class BrewInteractive:
             thread = threading.Thread(target=self._background_load_data)
             thread.daemon = True
             thread.start()
+        self.start_installed_prefetch(check_upgradeable=True)
 
         if show_top_packages:
             # Show top packages directly
@@ -1669,6 +2188,9 @@ class BrewInteractive:
                 # User selected top packages mode
                 self.showing_top_packages = True
                 self.load_top_packages(limit=100)
+            elif search_input == "INSTALLED":
+                # User selected installed packages mode
+                self.start_installed_load(check_upgradeable=True)
             elif search_input:
                 # User entered a search term
                 self.showing_top_packages = False
@@ -1686,7 +2208,11 @@ class BrewInteractive:
             if self.request_search_input:
                 self.request_search_input = False
                 search_input = self._search_input_flow(stdscr)
-                if search_input:
+                if search_input == "TOP_PACKAGES":
+                    self.load_top_packages(limit=100)
+                elif search_input == "INSTALLED":
+                    self.start_installed_load(check_upgradeable=True)
+                elif search_input:
                     self.showing_top_packages = False
                     self.run_brew_search(search_input)
             self.draw_screen(stdscr)
@@ -1709,7 +2235,7 @@ class BrewInteractive:
         stdscr.timeout(100)  # 100ms timeout
         curses.curs_set(1)  # Show cursor
 
-        # Mode selection: 0 = Search, 1 = Top Packages
+        # Mode selection: 0 = Search, 1 = Top Packages, 2 = Installed
         selected_mode = 0
         search_input = ""
         search_submitted = False
@@ -1725,10 +2251,11 @@ class BrewInteractive:
             content_start = max(4, (height - 12) // 2)
 
             # Draw mode selector
-            mode_titles = ["Search", "Top packages"]
+            mode_titles = ["Search", "Top packages", "Installed"]
             mode_descriptions = [
                 "Search anywhere in name",
                 "Show most popular packages not installed",
+                "Show installed packages (with update checks)",
             ]
             mode_label = "Mode: "
             mode_segments = [f" {title} " for title in mode_titles]
@@ -1788,8 +2315,11 @@ class BrewInteractive:
                     cursor_x = input_x + (input_width // 2)
                 input_y = input_block_y + 1
             else:
-                # Top Packages mode - no input field
-                action_text = "Press Enter to show top packages"
+                # Top Packages or Installed mode - no input field
+                if selected_mode == 1:
+                    action_text = "Press Enter to show top packages"
+                else:
+                    action_text = "Press Enter to show installed packages"
                 action_x = (width - len(action_text)) // 2
                 stdscr.addstr(input_block_y, action_x, action_text, curses.A_DIM)
                 cursor_x = 0
@@ -1802,10 +2332,16 @@ class BrewInteractive:
                         f"Search queued: '{search_input}' - waiting for data..."
                     ]
                 else:
-                    instructions = ["Up/Down: Switch mode | Enter: Search | Ctrl+C: Quit"]
+                    instructions = [
+                        "Up/Down/Tab: Switch mode | Enter: Search | Ctrl+C: Quit"
+                    ]
+            elif selected_mode == 1:
+                instructions = [
+                    "Up/Down/Tab: Switch mode | Enter: Show top packages | Ctrl+C: Quit"
+                ]
             else:
                 instructions = [
-                    "Up/Down: Switch mode | Enter: Show top packages | Ctrl+C: Quit"
+                    "Up/Down/Tab: Switch mode | Enter: Show installed packages | Ctrl+C: Quit"
                 ]
 
             instr_y = input_block_y + (3 if selected_mode == 0 else 2)
@@ -1943,15 +2479,27 @@ class BrewInteractive:
 
             # Handle mode navigation
             if ch == curses.KEY_UP:
-                selected_mode = 0
+                selected_mode = max(0, selected_mode - 1)
                 search_submitted = False
                 user_modified_after_submit = False
             elif ch == curses.KEY_DOWN:
-                selected_mode = 1
+                selected_mode = min(2, selected_mode + 1)
+                search_submitted = False
+                user_modified_after_submit = False
+            elif ch == 9:  # Tab
+                selected_mode = (selected_mode + 1) % 3
+                search_submitted = False
+                user_modified_after_submit = False
+            elif ch == getattr(curses, "KEY_BTAB", -1):
+                selected_mode = (selected_mode - 1) % 3
                 search_submitted = False
                 user_modified_after_submit = False
             elif ch in (curses.KEY_ENTER, 10, 13):  # Enter key
-                if selected_mode == 1:
+                if selected_mode == 2:
+                    stdscr.timeout(-1)  # Reset to blocking
+                    curses.curs_set(0)
+                    return "INSTALLED"
+                elif selected_mode == 1:
                     # Top Packages mode selected
                     if self.is_data_loaded:
                         stdscr.timeout(-1)  # Reset to blocking
@@ -2011,6 +2559,11 @@ def main():
         "--clear-cache", action="store_true", help="Clear all cached data and exit"
     )
     parser.add_argument(
+        "--prefetch",
+        action="store_true",
+        help="Download package data into the cache and exit",
+    )
+    parser.add_argument(
         "--top",
         type=int,
         metavar="N",
@@ -2033,6 +2586,10 @@ def main():
 
     # Create app with force_refresh flag
     app = BrewInteractive(force_refresh=args.refresh)
+
+    if args.prefetch:
+        success = app.prefetch_package_data()
+        raise SystemExit(0 if success else 1)
 
     # Run with top packages, search term, or interactive mode
     if args.top is not None:

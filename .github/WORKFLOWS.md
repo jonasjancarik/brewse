@@ -8,7 +8,8 @@ This directory contains GitHub Actions workflows for automating brewse releases.
 Automatically updates the Homebrew tap when a new release is published.
 
 **Triggers on**: GitHub release creation  
-**Does**: Updates `Formula/brewse.rb` in the `homebrew-tap` repository
+**Does**: Updates `Formula/brewse.rb` in the `homebrew-tap` repository, including
+the install-time cache prefetch and optional daily `brew services` refresh.
 
 See [AUTOMATION_SETUP.md](AUTOMATION_SETUP.md) for setup instructions.
 

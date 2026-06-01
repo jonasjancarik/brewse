@@ -51,6 +51,46 @@ jobs:
           # Update the formula file
           sed -i "s|url \"https://files.pythonhosted.org/packages/source/./.*/.*\.tar\.gz\"|url \"$URL\"|" Formula/brewse.rb
           sed -i "s|sha256 \".*\"|sha256 \"$SHA256\"|" Formula/brewse.rb
+
+          python - <<'PY'
+          from pathlib import Path
+
+          formula = Path("Formula/brewse.rb")
+          text = formula.read_text()
+          install_block = "\n".join([
+            "  def install",
+            "    virtualenv_install_with_resources",
+            "  end",
+            "",
+          ])
+          replacement = "\n".join([
+            "  def install",
+            "    virtualenv_install_with_resources",
+            "  end",
+            "",
+            "  def post_install",
+            "    system \"#{bin}/brewse\", \"--prefetch\"",
+            "  rescue",
+            "    opoo \"Unable to prefetch package data; Brewse will refresh on first launch.\"",
+            "  end",
+            "",
+            "  service do",
+            "    run [opt_bin/\"brewse\", \"--prefetch\"]",
+            "    run_type :interval",
+            "    interval 86_400",
+            "    environment_variables PATH: std_service_path_env",
+            "    log_path var/\"log/brewse.log\"",
+            "    error_log_path var/\"log/brewse.err.log\"",
+            "  end",
+            "",
+          ])
+
+          if "service do" not in text:
+            if install_block not in text:
+              raise SystemExit("Formula install block not found; update service insertion.")
+            text = text.replace(install_block, replacement)
+            formula.write_text(text)
+          PY
           
           # Show the diff
           git diff Formula/brewse.rb
