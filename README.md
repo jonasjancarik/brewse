@@ -14,11 +14,16 @@ The Homebrew formula warms Brewse's package cache during installation. To keep
 the cache warm automatically, enable the optional daily refresh service:
 
 ```bash
-brew services start brewse
+brew services start jonasjancarik/tap/brewse
 ```
 
 `brew install` does not start the background service by itself; use
-`brew services start brewse` only if you want the daily refresh.
+`brew services start jonasjancarik/tap/brewse` only if you want the daily
+refresh. For a one-time cache refresh without the background service, run:
+
+```bash
+"$(brew --prefix jonasjancarik/tap/brewse)/bin/brewse" --prefetch
+```
 
 ## Usage
 
